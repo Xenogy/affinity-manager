@@ -28,6 +28,7 @@ sudo ./manager.sh -f config.json
 | `-a [N]` | Auto-pick host cores (N per NUMA node, default 1) and write them into the config. |
 | `-s <script>` | Attach a hook script to each VM. |
 | `-r` | Print the commands to undo host core pinning. |
+| `-h` | Show usage and exit. |
 
 ## Configuration
 
