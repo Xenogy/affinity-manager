@@ -80,7 +80,7 @@ block mapping a VM or storage to a node, e.g.
 ## Examples
 
 ```bash
-# Auto-pick one host core per NUMA node, then apply
+# Auto-pick least-used node, then reserve host cores (1 physical + 1 SMT)
 sudo ./manager.sh -f config.json -a 1
 
 # Balance host cores across sockets (2 physical + 2 SMT each)
