@@ -13,6 +13,10 @@ GRUB_FILE="${GRUB_FILE:-/etc/default/grub}"
 SYSTEMD_ETC="${SYSTEMD_ETC:-/etc/systemd}"
 PCI_SYS_BASE="${PCI_SYS_BASE:-/sys/bus/pci/devices}"
 NODE_SYS_BASE="${NODE_SYS_BASE:-/sys/devices/system/node}"
+PROC_SYS_BASE="${PROC_SYS_BASE:-/proc/sys}"
+SYSCTL_D="${SYSCTL_D:-/etc/sysctl.d}"
+KSM_RUN_FILE="${KSM_RUN_FILE:-/sys/kernel/mm/ksm/run}"
+CPUFREQ_BASE="${CPUFREQ_BASE:-/sys/devices/system/cpu}"
 
 usage() {
     echo "Usage: $0 -f <config.json> [-n][-s <hook_script_path>] [-r] [-a [N]]"
@@ -1239,10 +1243,82 @@ EOF
         # reserved host cores at RUNTIME, complementing the boot-time
         # isolcpus=managed_irq/nohz_full/rcu_nocbs GRUB params set above.
         # CAVEAT: /proc/irq affinity is NOT persistent across reboot or NIC
-        # driver/link reset -- re-run after device init or such events. (The
-        # systemd drop-ins and GRUB params above persist; this placement does not.)
+        # driver/link reset -- run with -i after such events (or enable
+        # extras/affinity-manager-irq.service). (The systemd drop-ins and GRUB
+        # params above persist; this placement does not.)
         confine_device_irqs
+
+        apply_host_tuning
     }
+}
+
+# --- OPT-IN HOST TUNING (tuning_settings) ---
+# Pinning gets most of the way; these close the remaining host-side gaps.
+# All default OFF because they change host-global behavior:
+#   disable_numa_balancing: automatic NUMA balancing migrates tasks/pages to
+#     chase locality -- with statically bound VMs it only adds scan overhead
+#     and fights the explicit placement.
+#   disable_ksm: KSM cannot merge hugetlbfs-backed guests at all, so on a
+#     1G-hugepage host ksmd/ksmtuned is pure CPU overhead on the host cores.
+#   cpu_governor: cpufreq governor for the VM cores (e.g. "performance").
+apply_host_tuning() {
+    local disable_numab disable_ksm governor
+    disable_numab=$(jq -r '.tuning_settings.disable_numa_balancing // false' "$CONFIG_FILE")
+    disable_ksm=$(jq -r '.tuning_settings.disable_ksm // false' "$CONFIG_FILE")
+    governor=$(jq -r '.tuning_settings.cpu_governor // empty' "$CONFIG_FILE")
+
+    if [[ "$disable_numab" != "true" && "$disable_ksm" != "true" && -z "$governor" ]]; then
+        return 0
+    fi
+    log "Applying opt-in host tuning (tuning_settings)..."
+
+    local numab_file="${PROC_SYS_BASE}/kernel/numa_balancing"
+    if [[ "$disable_numab" == "true" ]]; then
+        if [[ $DRY_RUN -eq 1 ]]; then
+            log "  [DRY RUN] Would disable automatic NUMA balancing (kernel.numa_balancing=0, persisted in ${SYSCTL_D}/99-affinity-manager.conf)."
+        elif [[ -f "$numab_file" ]]; then
+            if echo 0 > "$numab_file" 2>/dev/null; then
+                mkdir -p "$SYSCTL_D"
+                printf 'kernel.numa_balancing = 0\n' > "${SYSCTL_D}/99-affinity-manager.conf"
+                log "  Automatic NUMA balancing disabled (persisted: ${SYSCTL_D}/99-affinity-manager.conf)."
+            else
+                warn "  Could not write $numab_file."
+            fi
+        else
+            log "  NUMA balancing knob not present ($numab_file); nothing to do."
+        fi
+    fi
+
+    if [[ "$disable_ksm" == "true" ]]; then
+        if [[ $DRY_RUN -eq 1 ]]; then
+            log "  [DRY RUN] Would stop KSM (systemctl disable --now ksmtuned; echo 2 > $KSM_RUN_FILE)."
+        else
+            systemctl disable --now ksmtuned 2>/dev/null || true
+            # 2 = stop ksmd AND unmerge all currently shared pages.
+            if [[ -f "$KSM_RUN_FILE" ]]; then
+                echo 2 > "$KSM_RUN_FILE" 2>/dev/null || true
+            fi
+            log "  KSM disabled (ksmtuned off, shared pages unmerged)."
+        fi
+    fi
+
+    if [[ -n "$governor" ]]; then
+        if [[ $DRY_RUN -eq 1 ]]; then
+            log "  [DRY RUN] Would set cpufreq governor '$governor' on ${#vm_cores_list[@]} VM core(s)."
+        else
+            local cpu gov_file set_count=0
+            for cpu in "${vm_cores_list[@]}"; do
+                gov_file="${CPUFREQ_BASE}/cpu${cpu}/cpufreq/scaling_governor"
+                if [[ -f "$gov_file" ]] && echo "$governor" > "$gov_file" 2>/dev/null; then
+                    set_count=$((set_count + 1))
+                fi
+            done
+            log "  cpufreq governor '$governor' set on ${set_count}/${#vm_cores_list[@]} VM core(s)."
+            if (( set_count == 0 )); then
+                warn "  No core accepted governor '$governor' (no cpufreq support, or invalid governor)."
+            fi
+        fi
+    fi
 }
 
 declare -A AVAILABLE_PHYS_CORES AVAILABLE_SMT_CORES

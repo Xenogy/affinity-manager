@@ -525,6 +525,50 @@ assert_exit_code 0 "$HOOK_RC" "hook exits 0 without affinity"
 assert_grep "$WORK/hook.log" "VM 102 has no affinity set" "explains the skip"
 
 # =============================================================================
+scenario "opt-in tuning_settings disable NUMA balancing/KSM and set the governor"
+cat > "$WORK/config.json" <<EOF
+{
+  "global_settings": { "reserve_host_cores": true, "host_cores": [0, 8], "state_file": "$WORK/state.json" },
+  "tuning_settings": {
+    "disable_numa_balancing": true,
+    "disable_ksm": true,
+    "cpu_governor": "performance"
+  },
+  "vms": { "101": 2 }
+}
+EOF
+export QM_FIXTURE_DIR="$FIXTURES/qm-mem"
+export GRUB_FILE="$WORK/grub"
+export SYSTEMD_ETC="$WORK/sysd"
+export PROC_SYS_BASE="$WORK/fake-procsys"
+export SYSCTL_D="$WORK/fake-sysctld"
+export KSM_RUN_FILE="$WORK/fake-ksm-run"
+export CPUFREQ_BASE="$WORK/fake-cpufreq"
+printf 'GRUB_CMDLINE_LINUX_DEFAULT="quiet"\n' > "$GRUB_FILE"
+mkdir -p "$PROC_SYS_BASE/kernel"
+echo 1 > "$PROC_SYS_BASE/kernel/numa_balancing"
+echo 1 > "$KSM_RUN_FILE"
+for c in 1 2 3 4 5 6 7 9 10 11 12 13 14 15; do
+    mkdir -p "$CPUFREQ_BASE/cpu$c/cpufreq"
+    echo "schedutil" > "$CPUFREQ_BASE/cpu$c/cpufreq/scaling_governor"
+done
+
+# Dry run first: plans only, changes nothing.
+run_manager -f "$WORK/config.json" -n -g
+assert_exit_code 0 "$RUN_RC" "dry run exits 0"
+assert_grep "$WORK/run.log" "\[DRY RUN\] Would disable automatic NUMA balancing" "numa plan printed"
+assert_grep "$WORK/fake-procsys/kernel/numa_balancing" "^1$" "dry run leaves numa_balancing alone"
+
+run_manager -f "$WORK/config.json" -g
+assert_exit_code 0 "$RUN_RC" "apply exits 0"
+assert_grep "$WORK/fake-procsys/kernel/numa_balancing" "^0$" "numa_balancing disabled"
+assert_grep "$WORK/fake-sysctld/99-affinity-manager.conf" "^kernel.numa_balancing = 0$" "sysctl persisted"
+assert_grep "$WORK/fake-ksm-run" "^2$" "KSM stopped and unmerged"
+assert_grep "$WORK/systemctl-calls.log" "^systemctl disable --now ksmtuned$" "ksmtuned disabled"
+assert_grep "$WORK/fake-cpufreq/cpu5/cpufreq/scaling_governor" "^performance$" "governor set on a VM core"
+assert_grep "$WORK/run.log" "cpufreq governor 'performance' set on 14/14 VM core\(s\)" "all VM cores covered"
+
+# =============================================================================
 echo ""
 echo "================================================="
 echo "  $PASS passed, $FAIL failed"
