@@ -423,6 +423,50 @@ assert_exit_code 0 "$RUN_RC" "plan still succeeds without a hugepage pool"
 assert_grep "$WORK/run.log" "1G hugepages planned, but this node exposes no 1G hugepage pool" "missing hugepage pool warned"
 
 # =============================================================================
+scenario "SMT siblings stay inside one VM even with mixed core counts"
+cat > "$WORK/config.json" <<'EOF'
+{
+  "global_settings": { "reserve_host_cores": true, "host_cores": [0, 8] },
+  "disk_settings": { "storage_node_map": { "local-lvm": "node:0" } },
+  "vms": { "101": 4, "102": 3, "103": 3 }
+}
+EOF
+export QM_FIXTURE_DIR="$FIXTURES/qm-basic"
+run_manager -f "$WORK/config.json" -n -g
+
+assert_exit_code 0 "$RUN_RC" "exits 0"
+# VM 101 (4 cores, node 0): phys 1,2 + their own siblings 9,10.
+assert_grep "$WORK/run.log" "\[DRY RUN\] Set Affinity: 1,2,9,10 \(Node 0\)" "VM 101 pairs phys with own siblings"
+# VM 103 (3 cores, node 1): phys 4,5 + sibling 12 (a sibling of core 4).
+assert_grep "$WORK/run.log" "\[DRY RUN\] Set Affinity: 4,5,12 \(Node 1\)" "VM 103 pairs phys with own sibling"
+# VM 102 (3 cores, node 1): phys 6,7 + sibling 14. The old allocator took the
+# SMT list head: 13 -- the sibling of VM 103's core 5, i.e. cross-VM sharing
+# of one physical core's pipeline.
+assert_grep "$WORK/run.log" "\[DRY RUN\] Set Affinity: 6,7,14 \(Node 1\)" "VM 102 avoids VM 103's sibling thread"
+
+# =============================================================================
+scenario "AMD-style interleaved sibling enumeration is classified correctly"
+export LSCPU_TOPOLOGY="$FIXTURES/topology-amd-interleaved.csv"
+# Siblings are ADJACENT here (cpu0+1 = core 0, ...). The old range-based split
+# (ids 0..7 physical, 8..15 SMT) would call four SMT threads "physical" and
+# reserve the wrong host cores.
+cat > "$WORK/config.json" <<'EOF'
+{
+  "global_settings": { "reserve_host_cores": true, "host_cores": [0, 1] },
+  "disk_settings": { "storage_node_map": { "local-lvm": "node:0" } },
+  "vms": { "101": 2, "102": 2, "103": 2, "104": 2 }
+}
+EOF
+export QM_FIXTURE_DIR="$FIXTURES/qm-basic"
+run_manager -f "$WORK/config.json" -n -g
+
+assert_exit_code 0 "$RUN_RC" "exits 0"
+assert_grep "$WORK/run.log" "CPUs: 8 physical core\(s\), 8 SMT thread\(s\)" "8/8 phys/SMT split detected despite interleaving"
+# VM 104 on node 0: physical cpu 2 plus its adjacent sibling cpu 3.
+assert_grep "$WORK/run.log" "\[DRY RUN\] Set Affinity: 2,3 \(Node 0\)" "interleaved sibling paired with its own core"
+assert_grep "$WORK/run.log" "\[DRY RUN\] Set Affinity: 8,9 \(Node 1\)" "overflow VM gets node-1 core pair"
+
+# =============================================================================
 echo ""
 echo "================================================="
 echo "  $PASS passed, $FAIL failed"

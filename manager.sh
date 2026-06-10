@@ -563,20 +563,17 @@ CPU_CONFIG_STRING=$(jq -r '.global_settings.cpu_config_string // "host"' "$CONFI
 HOST_CORES_JSON=$(jq -r '.global_settings.host_cores //[]' "$CONFIG_FILE")
 RESERVE_HOST_CORES=$(jq -r '.global_settings.reserve_host_cores' "$CONFIG_FILE")
 
-unique_cores=($(lscpu -p=CPU,CORE,SOCKET,NODE | grep -v '^#' | awk -F',' '{print $2}' | sort -n | uniq))
-max_core_id=${unique_cores[$(( ${#unique_cores[@]} - 1 ))]}
-total_cpus=$(lscpu -p=CPU,CORE | grep -v '^#' | wc -l)
-
-PHYS_START=0
-PHYS_END=$max_core_id
-SMT_START=$((max_core_id + 1))
-SMT_END=$((total_cpus - 1))
-
-log "  Physical: $PHYS_START-$PHYS_END | SMT: $SMT_START-$SMT_END"
-
 declare -A CPU_TO_CORE CPU_TO_NODE CPU_TO_SOCKET SOCKET_IDS MIN_CORE_PER_SOCKET CORES_TO_RESERVE_MAP
-declare -a NUMA_NODE_IDS CORES_TO_RESERVE
+declare -A CPU_IS_SMT CPU_SIBLINGS CORE_KEY_CPUS
+declare -a NUMA_NODE_IDS CORES_TO_RESERVE ALL_PHYS_CPUS ALL_SMT_CPUS
 
+# Physical-vs-SMT classification comes from the lscpu core map: the first CPU
+# listed for each socket:core is the "physical" (primary) thread, the rest are
+# its SMT siblings. The old assumption -- CPU IDs 0..max_core_id are physical
+# and the rest SMT -- only holds for Intel-style enumeration and silently
+# misclassifies hosts with interleaved sibling IDs (common on AMD EPYC) or
+# offline CPUs.
+MAX_CPU_ID=0
 lscpu_output=$(lscpu -p=CPU,CORE,SOCKET,NODE 2>&1)
 while IFS= read -r line; do
     [[ "$line" =~ ^# || -z "$line" ]] && continue
@@ -584,13 +581,48 @@ while IFS= read -r line; do
     node=${node:-0}; socket=${socket:-0}
     CPU_TO_CORE["$cpu"]=$core; CPU_TO_NODE["$cpu"]=$node; CPU_TO_SOCKET["$cpu"]=$socket
     SOCKET_IDS["$socket"]=1
+    if (( cpu > MAX_CPU_ID )); then MAX_CPU_ID=$cpu; fi
     if [[ ! " ${NUMA_NODE_IDS[*]} " =~ " ${node} " ]]; then NUMA_NODE_IDS+=("$node"); fi
-    if [[ -z "$core" ]]; then continue; fi
+    if [[ -z "$core" ]]; then
+        CPU_IS_SMT["$cpu"]=0
+        ALL_PHYS_CPUS+=("$cpu")
+        continue
+    fi
+    core_key="${socket}:${core}"
+    if [[ -v CORE_KEY_CPUS["$core_key"] ]]; then
+        CPU_IS_SMT["$cpu"]=1
+        ALL_SMT_CPUS+=("$cpu")
+        CORE_KEY_CPUS["$core_key"]+=" $cpu"
+    else
+        CPU_IS_SMT["$cpu"]=0
+        ALL_PHYS_CPUS+=("$cpu")
+        CORE_KEY_CPUS["$core_key"]=$cpu
+    fi
     if [[ ! -v MIN_CORE_PER_SOCKET["$socket"] || "$core" -lt "${MIN_CORE_PER_SOCKET["$socket"]}" ]]; then
         MIN_CORE_PER_SOCKET["$socket"]=$core
     fi
 done <<< "$lscpu_output"
 IFS=$'\n' NUMA_NODE_IDS=($(sort -n <<<"${NUMA_NODE_IDS[*]}")); unset IFS
+
+# Second pass: full sibling map (cpu -> the other thread(s) on its core).
+for core_key in "${!CORE_KEY_CPUS[@]}"; do
+    core_cpus=(${CORE_KEY_CPUS[$core_key]})
+    if (( ${#core_cpus[@]} < 2 )); then continue; fi
+    for cpu in "${core_cpus[@]}"; do
+        sibs=()
+        for sib in "${core_cpus[@]}"; do
+            if [[ "$sib" != "$cpu" ]]; then sibs+=("$sib"); fi
+        done
+        CPU_SIBLINGS["$cpu"]="${sibs[*]}"
+    done
+done
+unset core_key core_cpus sibs sib
+
+# SMT_END doubles as the maximum CPU id for iteration bounds throughout the
+# script; classification itself is map-based via CPU_IS_SMT.
+SMT_END=$MAX_CPU_ID
+
+log "  CPUs: ${#ALL_PHYS_CPUS[@]} physical core(s), ${#ALL_SMT_CPUS[@]} SMT thread(s), max CPU id $MAX_CPU_ID"
 
 # --- Auto-select host cores function (CONSOLIDATED TO ONE NODE) ---
 auto_select_host_cores() {
@@ -604,9 +636,9 @@ auto_select_host_cores() {
     # Only scan the target node for available cores
     for cpu_id in $(seq 0 $SMT_END); do
         if [[ -v CPU_TO_NODE["$cpu_id"] && "${CPU_TO_NODE[$cpu_id]}" == "$target_node" ]]; then
-            if (( cpu_id >= PHYS_START && cpu_id <= PHYS_END )); then
+            if [[ "${CPU_IS_SMT[$cpu_id]:-0}" == "0" ]]; then
                 node_phys_cores+=("$cpu_id")
-            elif (( cpu_id >= SMT_START && cpu_id <= SMT_END )); then
+            else
                 node_smt_cores+=("$cpu_id")
             fi
         fi
@@ -659,9 +691,9 @@ if [[ $AUTO_HOST_CORES -eq 1 ]]; then
             _sock_phys=(); _sock_smt=()
             for _cpu_id in $(seq 0 $SMT_END); do
                 [[ -v CPU_TO_SOCKET["$_cpu_id"] && "${CPU_TO_SOCKET[$_cpu_id]}" == "$_sock_id" ]] || continue
-                if (( _cpu_id >= PHYS_START && _cpu_id <= PHYS_END )); then
+                if [[ "${CPU_IS_SMT[$_cpu_id]:-0}" == "0" ]]; then
                     _sock_phys+=("$_cpu_id")
-                elif (( _cpu_id >= SMT_START && _cpu_id <= SMT_END )); then
+                else
                     _sock_smt+=("$_cpu_id")
                 fi
             done
@@ -1201,14 +1233,13 @@ declare -A AVAILABLE_PHYS_CORES AVAILABLE_SMT_CORES
 for node_id in "${NUMA_NODE_IDS[@]}"; do
     AVAILABLE_PHYS_CORES["$node_id"]=""; AVAILABLE_SMT_CORES["$node_id"]=""
 done
-for cpu_id in $(seq "$PHYS_START" "$PHYS_END"); do
+for cpu_id in $(seq 0 "$SMT_END"); do
     if [[ -v CPU_TO_NODE["$cpu_id"] && ! -v CORES_TO_RESERVE_MAP["$cpu_id"] ]]; then
-        AVAILABLE_PHYS_CORES["${CPU_TO_NODE[$cpu_id]}"]+="$cpu_id "
-    fi
-done
-for cpu_id in $(seq "$SMT_START" "$SMT_END"); do
-    if [[ -v CPU_TO_NODE["$cpu_id"] && ! -v CORES_TO_RESERVE_MAP["$cpu_id"] ]]; then
-        AVAILABLE_SMT_CORES["${CPU_TO_NODE[$cpu_id]}"]+="$cpu_id "
+        if [[ "${CPU_IS_SMT[$cpu_id]:-0}" == "0" ]]; then
+            AVAILABLE_PHYS_CORES["${CPU_TO_NODE[$cpu_id]}"]+="$cpu_id "
+        else
+            AVAILABLE_SMT_CORES["${CPU_TO_NODE[$cpu_id]}"]+="$cpu_id "
+        fi
     fi
 done
 
@@ -1804,12 +1835,17 @@ assign_resources() {
     
     local phys_needed=$cpu_count
     local smt_needed=0
-    
+
     if [[ "$USE_SMT_CORES" == true ]]; then
         phys_needed=$(echo "$cpu_count * $PHYSICAL_CORE_RATIO / 1" | bc)
-        if (( phys_needed > ${#avail_phys[@]} )); then phys_needed=${#avail_phys[@]}; fi
-        smt_needed=$(( cpu_count - phys_needed ))
     fi
+    # Clamp to what the node actually has and take the remainder from SMT.
+    # (Previously, with USE_SMT_CORES=false and a node short on physical cores,
+    # the array slice came up short and the VM silently got FEWER cores than
+    # configured.)
+    if (( phys_needed > ${#avail_phys[@]} )); then phys_needed=${#avail_phys[@]}; fi
+    smt_needed=$(( cpu_count - phys_needed ))
+    if (( smt_needed < 0 )); then smt_needed=0; fi
 
     if (( (phys_needed + smt_needed) > (${#avail_phys[@]} + ${#avail_smt[@]}) )); then
         error "VM $vmid: Node $target_node has insufficient cores! (GPU Locked)"
@@ -1823,8 +1859,35 @@ assign_resources() {
         fi
     fi
 
-    local assigned_cores=( "${avail_phys[@]:0:$phys_needed}" "${avail_smt[@]:0:$smt_needed}" )
-    
+    # Physical cores come off the front of the free list; SMT picks PREFER the
+    # siblings of this VM's own physical cores, so both threads of a core stay
+    # inside one VM. The old code took SMT threads in plain list order, which
+    # only happened to align when every VM had the same size -- with mixed core
+    # counts a VM could end up sharing a physical core's pipeline with a
+    # different VM (cross-VM noisy neighbor).
+    local assigned_phys=( "${avail_phys[@]:0:$phys_needed}" )
+    local assigned_smt=()
+    if (( smt_needed > 0 )); then
+        local -A _own_siblings=()
+        local _c _s
+        for _c in "${assigned_phys[@]}"; do
+            for _s in ${CPU_SIBLINGS[$_c]:-}; do _own_siblings["$_s"]=1; done
+        done
+        local -a _smt_pref=() _smt_rest=()
+        for _s in "${avail_smt[@]}"; do
+            if [[ -v _own_siblings["$_s"] ]]; then _smt_pref+=("$_s"); else _smt_rest+=("$_s"); fi
+        done
+        assigned_smt=( "${_smt_pref[@]:0:$smt_needed}" )
+        if (( ${#assigned_smt[@]} < smt_needed )); then
+            assigned_smt+=( "${_smt_rest[@]:0:$(( smt_needed - ${#assigned_smt[@]} ))}" )
+        fi
+    fi
+    local assigned_cores=( "${assigned_phys[@]}" "${assigned_smt[@]}" )
+
+    if (( ${#assigned_cores[@]} != cpu_count )); then
+        error "VM $vmid: internal allocation error on Node $target_node (got ${#assigned_cores[@]} of $cpu_count cores)."
+    fi
+
     # [FIX] Changed delimiter from ':' to '|' to handle PCI IDs correctly
     local plan="cores=$(IFS=,; echo "${assigned_cores[*]}")|node=${target_node}"
     if [[ -n "$gpu_pci" ]]; then plan="$plan|gpu_pci=${gpu_pci}|mdev=${gpu_mdev}"; fi
