@@ -75,8 +75,27 @@ scenario() {
     export QM_CALL_LOG="$WORK/qm-calls.log"
     export SYSTEMCTL_CALL_LOG="$WORK/systemctl-calls.log"
     export IRQ_PROC_BASE="$WORK/fake-irq"
-    unset LSPCI_FIXTURE NVIDIA_SMI_MEM_MB 2>/dev/null || true
+    unset LSPCI_FIXTURE NVIDIA_SMI_MEM_MB PCI_SYS_BASE NODE_SYS_BASE GRUB_FILE SYSTEMD_ETC 2>/dev/null || true
     mkdir -p "$IRQ_PROC_BASE"
+}
+
+# make_gpu <pci> <numa-node> <profile> <available-instances>: fake PCI sysfs
+make_gpu() {
+    local d="$WORK/fake-pci/$1"
+    mkdir -p "$d/mdev_supported_types/$3"
+    echo "$2" > "$d/numa_node"
+    echo "$4" > "$d/mdev_supported_types/$3/available_instances"
+    echo "num_heads=4, frl_config=60, framebuffer=2048M, max_resolution=5120x2880" \
+        > "$d/mdev_supported_types/$3/description"
+    export PCI_SYS_BASE="$WORK/fake-pci"
+}
+
+# make_node_hugepages <node> <nr_1g_pages>: fake NUMA-node hugepage sysfs
+make_node_hugepages() {
+    local d="$WORK/fake-node/node$1/hugepages/hugepages-1048576kB"
+    mkdir -p "$d"
+    echo "$2" > "$d/nr_hugepages"
+    export NODE_SYS_BASE="$WORK/fake-node"
 }
 
 # make_irq <number> <device-name> <affinity-list> [effective-list]
@@ -136,9 +155,15 @@ assert_grep "$WORK/run.log" "\[DRY RUN\] Set Affinity: 4,12 \(Node 1\)" "overflo
 # Dry run must not invoke qm set or systemctl mutations.
 assert_not_grep "$WORK/qm-calls.log" "^qm set" "dry run never calls qm set"
 assert_not_grep "$WORK/systemctl-calls.log" "set-property" "dry run never calls systemctl set-property"
+# Host pinning plan: qemu.slice AllowedCPUs (machine.slice CPUAffinity was inert).
+assert_grep "$WORK/run.log" "qemu\.slice\.d/99-vm-cores\.conf" "dry run plans qemu.slice drop-in"
+assert_grep "$WORK/run.log" "AllowedCPUs=1-7,9-15" "dry run plans AllowedCPUs ranges for VM cores"
+assert_not_grep "$WORK/run.log" "machine\.slice" "machine.slice no longer referenced"
 
-STATE_FILE_PATH="$WORK/manager_state.json"
-assert_file_exists "$STATE_FILE_PATH" "state file written"
+# Dry run writes its state beside the configured state file, never over it.
+STATE_FILE_PATH="$WORK/manager_state.json.dryrun"
+assert_file_exists "$STATE_FILE_PATH" "dry-run state file written to .dryrun"
+assert_file_absent "$WORK/manager_state.json" "real state file untouched by dry run"
 assert_json "$STATE_FILE_PATH" '.core_assignments | length == 4' "state file covers all 4 VMs"
 assert_json "$STATE_FILE_PATH" '.core_assignments["101"].numa_node == 1' "state file records VM 101 on node 1"
 
@@ -161,7 +186,141 @@ run_manager -f "$WORK/config.json" -r
 
 assert_exit_code 0 "$RUN_RC" "exits 0"
 assert_grep "$WORK/run.log" "systemctl set-property system.slice AllowedCPUs" "prints slice reset"
+assert_grep "$WORK/run.log" "qemu\.slice\.d/99-vm-cores\.conf" "reset covers qemu.slice drop-in"
 assert_not_grep "$WORK/qm-calls.log" "^qm" "reset mode never calls qm"
+
+# =============================================================================
+scenario "gpu-mode survives a host with zero NVIDIA devices"
+write_basic_config
+# No LSPCI_FIXTURE: lspci emits nothing. The lspci|grep pipeline used to kill
+# the script under set -e with no error message at all.
+run_manager -f "$WORK/config.json" -n
+
+assert_exit_code 0 "$RUN_RC" "exits 0 instead of dying silently"
+assert_grep "$WORK/run.log" "No NVIDIA display-class devices found" "warns about missing GPUs"
+assert_grep "$WORK/run.log" "Planning Complete" "planning still completes"
+
+# =============================================================================
+scenario "full apply writes qemu.slice drop-in, GRUB params, IRQ masks, qm config"
+cat > "$WORK/config.json" <<EOF
+{
+  "global_settings": {
+    "cpu_config_string": "host",
+    "reserve_host_cores": true,
+    "host_cores": [0, 8],
+    "parallel_jobs": 2,
+    "state_file": "$WORK/state.json"
+  },
+  "disk_settings": { "storage_node_map": { "local-lvm": "node:0" } },
+  "vms": { "101": 2, "102": 2, "103": 2, "104": 2 }
+}
+EOF
+export QM_FIXTURE_DIR="$FIXTURES/qm-mem"
+export GRUB_FILE="$WORK/grub"
+export SYSTEMD_ETC="$WORK/sysd"
+printf 'GRUB_DEFAULT=0\nGRUB_CMDLINE_LINUX_DEFAULT="quiet"\n' > "$GRUB_FILE"
+# Legacy drop-in from older versions must be cleaned up.
+mkdir -p "$SYSTEMD_ETC/system/machine.slice.d"
+printf '[Slice]\nCPUAffinity=1 2 3\n' > "$SYSTEMD_ETC/system/machine.slice.d/99-vm-cores.conf"
+make_node_hugepages 0 8
+make_node_hugepages 1 8
+make_irq 30 eth0 "0-15"
+make_irq 31 nvme0q1 "0,8"
+run_manager -f "$WORK/config.json" -g
+
+assert_exit_code 0 "$RUN_RC" "apply exits 0"
+assert_grep "$SYSTEMD_ETC/system/qemu.slice.d/99-vm-cores.conf" "^AllowedCPUs=1-7,9-15$" "qemu.slice drop-in uses AllowedCPUs"
+assert_file_absent "$SYSTEMD_ETC/system/machine.slice.d/99-vm-cores.conf" "obsolete machine.slice drop-in removed"
+assert_grep "$SYSTEMD_ETC/system.conf.d/99-host-cores.conf" "^CPUAffinity=0 8$" "PID1 CPUAffinity drop-in written"
+assert_grep "$WORK/grub" '^GRUB_CMDLINE_LINUX_DEFAULT="quiet isolcpus=managed_irq,domain,1-7,9-15 nohz_full=1-7,9-15 rcu_nocbs=1-7,9-15"$' "GRUB params appended inside existing double quotes"
+assert_grep "$IRQ_PROC_BASE/30/smp_affinity_list" "^0,8$" "overlapping device IRQ steered to host cores"
+assert_grep "$IRQ_PROC_BASE/31/smp_affinity_list" "^0,8$" "already-confined IRQ left as-is"
+assert_grep "$WORK/run.log" "IRQ confinement: 1 moved, 1 already on host cores" "IRQ summary correct"
+assert_grep "$WORK/systemctl-calls.log" "^systemctl set-property system.slice AllowedCPUs=0 8$" "host slice cpuset applied"
+assert_grep "$WORK/systemctl-calls.log" "^systemctl daemon-reexec$" "systemd reloaded"
+# Per-VM qm configuration (VM 104 planned first: cores 1,9 on node 0).
+assert_grep "$WORK/qm-calls.log" "^qm set 104 -cores 2 -cpu host -affinity 1,9$" "VM 104 affinity applied"
+assert_grep "$WORK/qm-calls.log" "^qm set 104 -numa 1 -numa0 cpus=0-1,hostnodes=0,memory=2048,policy=bind -hugepages 1024 -balloon 0$" "VM 104 NUMA binding applied"
+assert_grep "$WORK/qm-calls.log" "^qm set 101 -cores 2 -cpu host -affinity 4,12$" "VM 101 overflows to node 1 cores"
+assert_grep "$WORK/qm-calls.log" "^qm set 104 -net0 virtio=AA:BB:CC:DD:EE:04,bridge=vmbr0,queues=2$" "virtio multiqueue set to vCPU count"
+assert_grep "$WORK/qm-calls.log" "^qm set 104 -scsi0 local-lvm:vm-104-disk-0,size=32G,iothread=1$" "iothread enabled on boot disk"
+assert_file_exists "$WORK/state.json" "state written to configured state_file path"
+assert_json "$WORK/state.json" '.core_assignments | length == 4' "state covers all VMs"
+
+# =============================================================================
+scenario "apply preserves single-quoted GRUB_CMDLINE_LINUX_DEFAULT"
+cat > "$WORK/config.json" <<EOF
+{
+  "global_settings": { "reserve_host_cores": true, "host_cores": [0, 8], "state_file": "$WORK/state.json" },
+  "vms": { "101": 2 }
+}
+EOF
+export QM_FIXTURE_DIR="$FIXTURES/qm-mem"
+export GRUB_FILE="$WORK/grub"
+export SYSTEMD_ETC="$WORK/sysd"
+printf "GRUB_CMDLINE_LINUX_DEFAULT='quiet splash'\n" > "$GRUB_FILE"
+run_manager -f "$WORK/config.json" -g
+
+assert_exit_code 0 "$RUN_RC" "apply exits 0"
+assert_grep "$WORK/grub" "^GRUB_CMDLINE_LINUX_DEFAULT='quiet splash isolcpus=managed_irq,domain,1-7,9-15 nohz_full=1-7,9-15 rcu_nocbs=1-7,9-15'$" "params appended inside single quotes, no stray double quote"
+
+# =============================================================================
+scenario "reserving every CPU fails the plan cleanly, not with a crash"
+cat > "$WORK/config.json" <<'EOF'
+{
+  "global_settings": {
+    "reserve_host_cores": true,
+    "host_cores": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]
+  },
+  "vms": { "101": 2 }
+}
+EOF
+run_manager -f "$WORK/config.json" -n -g
+
+assert_exit_code 1 "$RUN_RC" "exits 1"
+assert_grep "$WORK/run.log" "Reserved host cores cover every CPU" "explains the empty VM-core set"
+assert_grep "$WORK/run.log" "no NUMA node has enough free cores" "planner reports the real problem"
+assert_not_grep "$WORK/run.log" "unbound variable" "no bash crash"
+
+# =============================================================================
+scenario "gpu pairing assigns NUMA-local slots with disk-locality preference"
+write_basic_config
+# Add the second GPU to the profile map.
+jq '.gpu_settings.gpu_profile_map["0000:84:00.0"] = "nvidia-47"' "$WORK/config.json" > "$WORK/config.json.tmp"
+mv "$WORK/config.json.tmp" "$WORK/config.json"
+export LSPCI_FIXTURE="$FIXTURES/lspci-two-gpus.txt"
+make_gpu 0000:04:00.0 0 nvidia-47 2
+make_gpu 0000:84:00.0 1 nvidia-47 2
+run_manager -f "$WORK/config.json" -n
+
+assert_exit_code 0 "$RUN_RC" "exits 0"
+assert_grep "$WORK/run.log" "Registered GPU 0000:04:00.0: Profile nvidia-47 \| Slots Available: 2 \| Node: 0" "GPU on node 0 registered"
+assert_grep "$WORK/run.log" "Registered GPU 0000:84:00.0: Profile nvidia-47 \| Slots Available: 2 \| Node: 1" "GPU on node 1 registered"
+assert_grep "$WORK/run.log" "Assigning GPU 0000:04:00.0 \(nvidia-47\) on Node 0 to VM 104 \(disk prefers Node 0.*matched=yes" "first VM pairs with disk-local GPU"
+assert_grep "$WORK/run.log" "Assigning GPU 0000:84:00.0 \(nvidia-47\) on Node 1 to VM 102" "third VM spills to node-1 GPU when node-0 slots exhaust"
+assert_grep "$WORK/run.log" "4 VM\(s\) with GPU, 0 VM\(s\) CPU-only" "all VMs got a GPU"
+assert_grep "$WORK/run.log" "\[DRY RUN\] Set GPU: 0000:84:00.0 \(nvidia-47\)" "GPU attach planned"
+
+# =============================================================================
+scenario "-a least-GPU-loaded node selection works with auto-detected GPUs"
+cat > "$WORK/config.json" <<'EOF'
+{
+  "global_settings": { "reserve_host_cores": true, "host_cores": [] },
+  "gpu_settings": { "required_vram_mb": 2048, "auto_detect_profile": true },
+  "disk_settings": { "storage_node_map": { "local-lvm": "node:0" } },
+  "vms": { "101": 2, "102": 2, "103": 2, "104": 2 }
+}
+EOF
+export LSPCI_FIXTURE="$FIXTURES/lspci-two-gpus.txt"
+# Node 0 GPU has free slots, node 1 GPU has none -> node 1 is least loaded.
+make_gpu 0000:04:00.0 0 nvidia-47 2
+make_gpu 0000:84:00.0 1 nvidia-47 0
+run_manager -f "$WORK/config.json" -n -a 1
+
+assert_exit_code 0 "$RUN_RC" "exits 0"
+assert_grep "$WORK/run.log" "Least GPU-loaded NUMA node: Node 1" "auto-detected GPUs drive node selection (was: always node 0)"
+assert_grep "$WORK/run.log" "DRY RUN: Would update host_cores" "dry run does not rewrite config"
+assert_grep "$WORK/run.log" "Planning Complete" "planning completes"
 
 # =============================================================================
 echo ""

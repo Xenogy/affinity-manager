@@ -2,9 +2,17 @@
 set -euo pipefail
 
 # --- HELPER FUNCTIONS ---
-log() { echo "[INFO] $@"; }
-warn() { echo "[WARN] $@" >&2; }
-error() { echo "[ERROR] $@" >&2; exit 1; }
+log() { echo "[INFO] $*"; }
+warn() { echo "[WARN] $*" >&2; }
+error() { echo "[ERROR] $*" >&2; exit 1; }
+
+# --- SYSTEM PATH OVERRIDES (testing hooks) ---
+# Every host touchpoint can be redirected at a fake tree so the full pipeline
+# is testable in a container (see tests/). Defaults are the real paths.
+GRUB_FILE="${GRUB_FILE:-/etc/default/grub}"
+SYSTEMD_ETC="${SYSTEMD_ETC:-/etc/systemd}"
+PCI_SYS_BASE="${PCI_SYS_BASE:-/sys/bus/pci/devices}"
+NODE_SYS_BASE="${NODE_SYS_BASE:-/sys/devices/system/node}"
 
 usage() {
     echo "Usage: $0 -f <config.json> [-n][-s <hook_script_path>] [-r] [-a [N]]"
@@ -124,7 +132,7 @@ replay_captured() {
 # =============================================================================
 
 create_state_file() {
-    local state_file="manager_state.json"
+    local state_file="$STATE_FILE"
     local timestamp=$(date -Iseconds)
 
     log "Creating state file: $state_file"
@@ -472,6 +480,12 @@ done
 
 if [[ -z "$CONFIG_FILE" ]]; then error "Configuration file (-f) is required."; fi
 if [[ ! -f "$CONFIG_FILE" ]]; then error "Configuration file not found."; fi
+# qm only accepts hookscripts as storage volume IDs (e.g. local:snippets/hook.sh)
+# on a storage with the 'snippets' content type -- a plain filesystem path fails
+# at apply time on every VM. Catch it up front.
+if [[ -n "$HOOK_SCRIPT_PATH" && "$HOOK_SCRIPT_PATH" != *:* ]]; then
+    warn "Hook script '$HOOK_SCRIPT_PATH' looks like a filesystem path; qm expects a storage volume ID (e.g. local:snippets/hook.sh) and will reject this."
+fi
 if [[ $DRY_RUN -eq 0 && $EUID -ne 0 ]]; then error "Run as root or use dry-run."; fi
 for cmd in qm lscpu jq bc lspci; do
     if ! command -v "$cmd" &> /dev/null; then error "Required command '$cmd' not found."; fi
@@ -485,12 +499,14 @@ if [[ $RESET_HOST_PINNING -eq 1 ]]; then
     echo "  systemctl set-property system.slice AllowedCPUs=\"\""
     echo "  systemctl set-property user.slice AllowedCPUs=\"\""
     echo "  systemctl set-property init.scope AllowedCPUs=\"\""
+    echo "  systemctl set-property --runtime qemu.slice AllowedCPUs=\"\""
     echo ""
     echo "  # Remove CPUAffinity drop-in for PID 1 (systemd manager)"
-    echo "  rm -f /etc/systemd/system.conf.d/99-host-cores.conf"
+    echo "  rm -f ${SYSTEMD_ETC}/system.conf.d/99-host-cores.conf"
     echo ""
-    echo "  # Remove CPUAffinity drop-in for machine.slice (VMs)"
-    echo "  rm -f /etc/systemd/system/machine.slice.d/99-vm-cores.conf"
+    echo "  # Remove AllowedCPUs drop-in for qemu.slice (and the obsolete machine.slice one)"
+    echo "  rm -f ${SYSTEMD_ETC}/system/qemu.slice.d/99-vm-cores.conf"
+    echo "  rm -f ${SYSTEMD_ETC}/system/machine.slice.d/99-vm-cores.conf"
     echo ""
     echo "  # Reload systemd to apply changes"
     echo "  systemctl daemon-reexec"
@@ -508,6 +524,18 @@ if [[ ! "$PARALLEL_JOBS" =~ ^[0-9]+$ ]] || (( PARALLEL_JOBS < 1 )); then
 fi
 (( PARALLEL_JOBS >= 1 )) || PARALLEL_JOBS=1
 log "Parallelism: up to ${PARALLEL_JOBS} concurrent job(s) for discovery and execution."
+
+# --- STATE FILE LOCATION ---
+# Honor global_settings.state_file (previously read by nothing and silently
+# ignored). Dry runs write to a separate .dryrun file so a preview never
+# clobbers the record of the last real apply.
+STATE_FILE=$(jq -r '.global_settings.state_file // empty' "$CONFIG_FILE")
+if [[ -z "$STATE_FILE" || "$STATE_FILE" == "null" ]]; then
+    STATE_FILE="manager_state.json"
+fi
+if [[ $DRY_RUN -eq 1 ]]; then
+    STATE_FILE="${STATE_FILE}.dryrun"
+fi
 
 
 # =============================================================================
@@ -647,22 +675,30 @@ if [[ $AUTO_HOST_CORES -eq 1 ]]; then
         declare -A _node_gpu_slots
         for _nid in "${NUMA_NODE_IDS[@]}"; do _node_gpu_slots["$_nid"]=0; done
         _target_vram=$(jq -r '.gpu_settings.required_vram_mb // 2048' "$CONFIG_FILE")
+        # Same candidate sources as discover_gpus: config override first, then
+        # lspci auto-detection. (Previously only config-listed GPUs were counted,
+        # so auto-detected setups always scored 0 and silently picked node 0.)
+        _pci_list=$(jq -r '(.gpu_settings.gpu_pci_ids // (.gpu_settings.gpu_profile_map // {} | keys))[]' \
+            "$CONFIG_FILE" 2>/dev/null)
+        if [[ -z "$_pci_list" && $SKIP_GPU -eq 0 ]]; then
+            _pci_list=$(lspci -D -nn | grep -E "\[03[0-9a-fA-F]{2}\]" | grep -i nvidia | cut -d' ' -f1 || true)
+        fi
         while IFS= read -r _pci; do
             [[ -z "$_pci" ]] && continue
-            _pci_node=$(cat "/sys/bus/pci/devices/${_pci}/numa_node" 2>/dev/null || echo -1)
+            _pci_node=$(cat "${PCI_SYS_BASE}/${_pci}/numa_node" 2>/dev/null || echo -1)
             [[ "$_pci_node" == "-1" ]] && _pci_node=0
             _prof=$(jq -r --arg p "$_pci" \
                 '.gpu_settings.gpu_profile_map[$p] // .gpu_settings.mdev_override // "nvidia-47"' \
                 "$CONFIG_FILE")
-            _avail=$(cat "/sys/bus/pci/devices/${_pci}/mdev_supported_types/${_prof}/available_instances" 2>/dev/null || echo 0)
+            _avail=$(cat "${PCI_SYS_BASE}/${_pci}/mdev_supported_types/${_prof}/available_instances" 2>/dev/null || echo 0)
             _mem=$(nvidia-smi --id="$_pci" --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null || echo 0)
             if [[ "$_mem" =~ ^[0-9]+$ ]] && (( _mem > 0 )); then
                 _max_by_vram=$(( _mem / _target_vram ))
                 (( _max_by_vram < _avail )) && _avail=$_max_by_vram
             fi
             _node_gpu_slots["$_pci_node"]=$(( ${_node_gpu_slots[$_pci_node]:-0} + _avail ))
-        done < <(jq -r '(.gpu_settings.gpu_pci_ids // (.gpu_settings.gpu_profile_map // {} | keys))[]' \
-            "$CONFIG_FILE" 2>/dev/null)
+        done <<< "$_pci_list"
+        unset _pci_list
         TARGET_NODE=${NUMA_NODE_IDS[0]}
         _min_slots=${_node_gpu_slots[${NUMA_NODE_IDS[0]}]:-0}
         for _nid in "${NUMA_NODE_IDS[@]}"; do
@@ -712,6 +748,10 @@ fi
 # Convert a sorted list of CPU IDs to compact range notation (e.g., "2-21,24-43")
 cpus_to_ranges() {
     local cpus=($(echo "$@" | tr ' ' '\n' | sort -n))
+    if (( ${#cpus[@]} == 0 )); then
+        echo ""
+        return 0
+    fi
     local ranges=""
     local start=${cpus[0]}
     local prev=${cpus[0]}
@@ -925,14 +965,20 @@ if [[ "$RESERVE_HOST_CORES" == "true" ]]; then
     if [[ ${#CORES_TO_RESERVE[@]} -gt 0 ]]; then
         host_cores_string=$(IFS=' '; echo "${CORES_TO_RESERVE[*]}")
 
-        # Build the inverse set (all non-reserved cores) for machine.slice
+        # Build the inverse set (all non-reserved cores) for the VM slice
         vm_cores_list=()
         for cpu_id in $(seq 0 $SMT_END); do
             if [[ ! -v CORES_TO_RESERVE_MAP["$cpu_id"] ]]; then
                 vm_cores_list+=("$cpu_id")
             fi
         done
-        vm_cores_string=$(IFS=' '; echo "${vm_cores_list[*]}")
+
+        vm_cores_ranges=""
+        if (( ${#vm_cores_list[@]} > 0 )); then
+            vm_cores_ranges=$(cpus_to_ranges "${vm_cores_list[@]}")
+        else
+            warn "Reserved host cores cover every CPU; no cores remain for VMs. Skipping qemu.slice/GRUB isolation."
+        fi
 
         if [[ $DRY_RUN -eq 0 ]]; then
             log "Applying host core pinning..."
@@ -944,24 +990,46 @@ if [[ "$RESERVE_HOST_CORES" == "true" ]]; then
             systemctl set-property init.scope AllowedCPUs="$host_cores_string"
 
             # 2. CPUAffinity drop-in for PID 1 (systemd manager)
-            log "  Writing /etc/systemd/system.conf.d/99-host-cores.conf..."
-            mkdir -p /etc/systemd/system.conf.d
-            cat > /etc/systemd/system.conf.d/99-host-cores.conf << EOF
+            log "  Writing ${SYSTEMD_ETC}/system.conf.d/99-host-cores.conf..."
+            mkdir -p "${SYSTEMD_ETC}/system.conf.d"
+            cat > "${SYSTEMD_ETC}/system.conf.d/99-host-cores.conf" << EOF
 [Manager]
 CPUAffinity=$host_cores_string
 EOF
 
-            # 3. CPUAffinity drop-in for machine.slice (pin VMs to non-host cores)
-            log "  Writing /etc/systemd/system/machine.slice.d/99-vm-cores.conf..."
-            mkdir -p /etc/systemd/system/machine.slice.d
-            cat > /etc/systemd/system/machine.slice.d/99-vm-cores.conf << EOF
+            # 3. AllowedCPUs drop-in for qemu.slice (pin VMs to non-host cores).
+            # Proxmox runs QEMU guests in qemu.slice (machine.slice is libvirt's
+            # convention), and CPUAffinity= is a systemd *exec* directive that is
+            # invalid in [Slice] sections -- the previous machine.slice drop-in
+            # was silently ignored by systemd on both counts. AllowedCPUs= is the
+            # cpuset-based directive slices actually support, and it also keeps
+            # VMs that are NOT in the config off the reserved host cores.
+            if [[ -n "$vm_cores_ranges" ]]; then
+                log "  Writing ${SYSTEMD_ETC}/system/qemu.slice.d/99-vm-cores.conf..."
+                mkdir -p "${SYSTEMD_ETC}/system/qemu.slice.d"
+                cat > "${SYSTEMD_ETC}/system/qemu.slice.d/99-vm-cores.conf" << EOF
 [Slice]
-CPUAffinity=$vm_cores_string
+AllowedCPUs=$vm_cores_ranges
 EOF
+            fi
+
+            # Migration: remove the obsolete (inert) machine.slice drop-in.
+            if [[ -f "${SYSTEMD_ETC}/system/machine.slice.d/99-vm-cores.conf" ]]; then
+                log "  Removing obsolete machine.slice drop-in (CPUAffinity= is not valid for slices)..."
+                rm -f "${SYSTEMD_ETC}/system/machine.slice.d/99-vm-cores.conf"
+            fi
 
             # 4. Reload systemd to pick up the drop-in files
             log "  Reloading systemd (daemon-reexec)..."
             systemctl daemon-reexec
+
+            # Drop-ins affect qemu.slice when it is (re)loaded; if VMs are
+            # already running the slice is live, so apply the cpuset now too.
+            # --runtime keeps the drop-in above as the single persistent source.
+            if [[ -n "$vm_cores_ranges" ]] && systemctl is-active --quiet qemu.slice 2>/dev/null; then
+                log "  qemu.slice is active; applying AllowedCPUs to the live slice..."
+                systemctl set-property --runtime qemu.slice AllowedCPUs="$vm_cores_ranges"
+            fi
 
             log "Host core pinning applied successfully."
         else
@@ -973,38 +1041,55 @@ EOF
             echo "  systemctl set-property init.scope AllowedCPUs=\"$host_cores_string\""
             echo ""
             echo "  # CPUAffinity drop-in for PID 1 (systemd manager)"
-            echo "  mkdir -p /etc/systemd/system.conf.d"
-            echo "  cat > /etc/systemd/system.conf.d/99-host-cores.conf << EOF"
+            echo "  mkdir -p ${SYSTEMD_ETC}/system.conf.d"
+            echo "  cat > ${SYSTEMD_ETC}/system.conf.d/99-host-cores.conf << EOF"
             echo "  [Manager]"
             echo "  CPUAffinity=$host_cores_string"
             echo "  EOF"
             echo ""
-            echo "  # CPUAffinity drop-in for machine.slice (pin VMs to non-host cores)"
-            echo "  mkdir -p /etc/systemd/system/machine.slice.d"
-            echo "  cat > /etc/systemd/system/machine.slice.d/99-vm-cores.conf << EOF"
-            echo "  [Slice]"
-            echo "  CPUAffinity=$vm_cores_string"
-            echo "  EOF"
-            echo ""
+            if [[ -n "$vm_cores_ranges" ]]; then
+                echo "  # AllowedCPUs drop-in for qemu.slice (pin VMs to non-host cores)"
+                echo "  mkdir -p ${SYSTEMD_ETC}/system/qemu.slice.d"
+                echo "  cat > ${SYSTEMD_ETC}/system/qemu.slice.d/99-vm-cores.conf << EOF"
+                echo "  [Slice]"
+                echo "  AllowedCPUs=$vm_cores_ranges"
+                echo "  EOF"
+                echo ""
+            fi
             echo "  # Reload systemd"
             echo "  systemctl daemon-reexec"
             echo ""
         fi
 
         # --- GRUB kernel isolation parameters ---
-        vm_cores_ranges=$(cpus_to_ranges "${vm_cores_list[@]}")
-        grub_file="/etc/default/grub"
+        # Append a kernel param to $updated_line, respecting whichever quote
+        # style the existing GRUB_CMDLINE_LINUX_DEFAULT line uses. (The old code
+        # assumed a trailing double quote; on single-quoted or unquoted lines it
+        # appended a stray '"' and corrupted /etc/default/grub.)
+        grub_append_param() {
+            local param=$1
+            case "$updated_line" in
+                *\") updated_line="${updated_line%\"} ${param}\"" ;;
+                *\') updated_line="${updated_line%\'} ${param}'" ;;
+                *)
+                    local val=${updated_line#GRUB_CMDLINE_LINUX_DEFAULT=}
+                    updated_line="GRUB_CMDLINE_LINUX_DEFAULT=\"${val:+$val }${param}\""
+                    ;;
+            esac
+        }
 
+        if [[ -n "$vm_cores_ranges" ]]; then
         # Build the three kernel params
         isolcpus_val="managed_irq,domain,${vm_cores_ranges}"
         nohz_val="${vm_cores_ranges}"
         rcu_val="${vm_cores_ranges}"
 
+        grub_file="$GRUB_FILE"
         if [[ -f "$grub_file" ]]; then
-            current_line=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' "$grub_file" || true)
-            current_isolcpus=$(echo "$current_line" | grep -oP 'isolcpus=[^\s"]+' || true)
-            current_nohz=$(echo "$current_line" | grep -oP 'nohz_full=[^\s"]+' || true)
-            current_rcu=$(echo "$current_line" | grep -oP 'rcu_nocbs=[^\s"]+' || true)
+            current_line=$(grep -m1 '^GRUB_CMDLINE_LINUX_DEFAULT=' "$grub_file" || true)
+            current_isolcpus=$(echo "$current_line" | grep -oP "isolcpus=[^\s\"']+" || true)
+            current_nohz=$(echo "$current_line" | grep -oP "nohz_full=[^\s\"']+" || true)
+            current_rcu=$(echo "$current_line" | grep -oP "rcu_nocbs=[^\s\"']+" || true)
 
             new_isolcpus="isolcpus=${isolcpus_val}"
             new_nohz="nohz_full=${nohz_val}"
@@ -1017,27 +1102,40 @@ EOF
 
             if [[ "$needs_update" == "true" ]]; then
                 # Build updated line: replace existing params or append
-                updated_line="$current_line"
-                if [[ -n "$current_isolcpus" ]]; then
-                    updated_line="${updated_line//$current_isolcpus/$new_isolcpus}"
+                if [[ -n "$current_line" ]]; then
+                    updated_line="$current_line"
+                    if [[ -n "$current_isolcpus" ]]; then
+                        updated_line="${updated_line//$current_isolcpus/$new_isolcpus}"
+                    else
+                        grub_append_param "$new_isolcpus"
+                    fi
+                    if [[ -n "$current_nohz" ]]; then
+                        updated_line="${updated_line//$current_nohz/$new_nohz}"
+                    else
+                        grub_append_param "$new_nohz"
+                    fi
+                    if [[ -n "$current_rcu" ]]; then
+                        updated_line="${updated_line//$current_rcu/$new_rcu}"
+                    else
+                        grub_append_param "$new_rcu"
+                    fi
                 else
-                    updated_line="${updated_line%\"} ${new_isolcpus}\""
-                fi
-                if [[ -n "$current_nohz" ]]; then
-                    updated_line="${updated_line//$current_nohz/$new_nohz}"
-                else
-                    updated_line="${updated_line%\"} ${new_nohz}\""
-                fi
-                if [[ -n "$current_rcu" ]]; then
-                    updated_line="${updated_line//$current_rcu/$new_rcu}"
-                else
-                    updated_line="${updated_line%\"} ${new_rcu}\""
+                    updated_line="GRUB_CMDLINE_LINUX_DEFAULT=\"${new_isolcpus} ${new_nohz} ${new_rcu}\""
                 fi
 
                 if [[ $DRY_RUN -eq 0 ]]; then
                     log "Updating GRUB kernel isolation parameters..."
                     cp "$grub_file" "${grub_file}.backup.$(date +%Y%m%d_%H%M%S)"
-                    sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|${updated_line}|" "$grub_file"
+                    if [[ -n "$current_line" ]]; then
+                        # Escape sed replacement metacharacters so an unusual
+                        # cmdline can't break the substitution.
+                        sed_replacement=${updated_line//\\/\\\\}
+                        sed_replacement=${sed_replacement//&/\\&}
+                        sed_replacement=${sed_replacement//|/\\|}
+                        sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|${sed_replacement}|" "$grub_file"
+                    else
+                        echo "$updated_line" >> "$grub_file"
+                    fi
                     log "  Updated $grub_file"
                     log "  Run 'update-grub' and reboot for changes to take effect."
                 else
@@ -1055,6 +1153,7 @@ EOF
             fi
         else
             warn "GRUB config $grub_file not found, skipping kernel param update."
+        fi
         fi
 
         # IRQs are host work: steer movable device IRQs off VM cores onto the
@@ -1106,14 +1205,14 @@ discover_one_gpu() {
     local auto_detect=$4
     local manual_mdev=$5
 
-    local numa_path="/sys/bus/pci/devices/${pci_slot}/numa_node"
+    local numa_path="${PCI_SYS_BASE}/${pci_slot}/numa_node"
     local numa_node="0"
     if [[ -f "$numa_path" ]]; then
         val=$(cat "$numa_path")
         if [[ "$val" != "-1" ]]; then numa_node=$val; fi
     fi
 
-    local mdev_base="/sys/bus/pci/devices/${pci_slot}/mdev_supported_types"
+    local mdev_base="${PCI_SYS_BASE}/${pci_slot}/mdev_supported_types"
     local selected_type=""
     local available_instances=0
 
@@ -1189,7 +1288,9 @@ discover_gpus() {
         # Fake lspci lines: just the PCI slot — the loop only uses field 1
         lspci_input=$(jq -r '(.gpu_settings.gpu_pci_ids // [])[]' "$CONFIG_FILE")
     else
-        lspci_input=$(lspci -D -nn | grep -E "\[03[0-9a-fA-F]{2}\]" | grep -i nvidia)
+        # `|| true`: with zero NVIDIA devices the grep pipeline returns nonzero,
+        # which under set -e used to kill the whole script silently right here.
+        lspci_input=$(lspci -D -nn | grep -E "\[03[0-9a-fA-F]{2}\]" | grep -i nvidia || true)
         if [[ -z "$lspci_input" ]]; then
             warn "  No NVIDIA display-class devices found via lspci. Check lspci output or set gpu_settings.gpu_pci_ids in config."
         fi
@@ -1253,7 +1354,7 @@ fi
 log "  Hugepage node safety margin: ${HUGEPAGE_NODE_SAFETY_PAGES} x 1G page(s)."
 
 for node_id in "${NUMA_NODE_IDS[@]}"; do
-    hp_file="/sys/devices/system/node/node${node_id}/hugepages/hugepages-1048576kB/nr_hugepages"
+    hp_file="${NODE_SYS_BASE}/node${node_id}/hugepages/hugepages-1048576kB/nr_hugepages"
     NODE_1G_HUGEPAGES_PLANNED["$node_id"]=0
     if [[ -f "$hp_file" ]]; then
         hp_total=$(cat "$hp_file" 2>/dev/null || echo "-1")
@@ -1836,10 +1937,21 @@ execute_one_vm() {
     cpu_count=${VMS_TO_CONFIGURE[$vmid]}
 
     if [[ $DRY_RUN -eq 0 ]]; then
-        local vm_mem line iface boot_disk disk_line disk_opts disk_path
+        local vm_cfg vm_mem numa0_spec line iface boot_disk disk_line disk_spec disk_opts disk_path scsihw
         qm set "$vmid" -cores "$cpu_count" -cpu "$CPU_CONFIG_STRING" -affinity "$affinity"
-        vm_mem=$(qm config "$vmid" | grep '^memory:' | awk '{print $2}')
-        qm set "$vmid" -numa 1 -numa0 "cpus=0-$((cpu_count-1)),hostnodes=$node,memory=$vm_mem,policy=bind" -hugepages 1024 -balloon 0
+
+        # One config snapshot for all subsequent reads. (None of this run's
+        # earlier writes change the keys read below, and the old per-read
+        # `grep '^memory:'` killed the whole VM job under set -e when a config
+        # had no explicit memory line.)
+        vm_cfg=$(qm config "$vmid")
+        vm_mem=$(echo "$vm_cfg" | awk '/^memory:/ {print $2; exit}')
+        numa0_spec="cpus=0-$((cpu_count-1)),hostnodes=$node,memory=$vm_mem,policy=bind"
+        if [[ -z "$vm_mem" ]]; then
+            warn "  VM $vmid has no explicit memory setting; binding NUMA node without a memory clause."
+            numa0_spec="cpus=0-$((cpu_count-1)),hostnodes=$node,policy=bind"
+        fi
+        qm set "$vmid" -numa 1 -numa0 "$numa0_spec" -hugepages 1024 -balloon 0
 
         if [[ $SKIP_GPU -eq 0 ]]; then
             if [[ -n "$gpu_pci" && -n "$gpu_mdev" ]]; then
@@ -1847,7 +1959,7 @@ execute_one_vm() {
                 qm set "$vmid" -hostpci0 "${gpu_pci},mdev=${gpu_mdev},pcie=1,x-vga=1"
             else
                 warn "  No GPU assigned for VM $vmid (best-effort fallback)."
-                if qm config "$vmid" | grep -q '^hostpci0:'; then
+                if echo "$vm_cfg" | grep -q '^hostpci0:'; then
                     log "  Removing existing hostpci0 to match fallback plan."
                     qm set "$vmid" -delete hostpci0
                 fi
@@ -1857,20 +1969,38 @@ execute_one_vm() {
         while read -r line; do
              iface=$(echo "$line" | cut -d: -f1)
              qm set "$vmid" -"$iface" "$(echo "$line" | cut -d' ' -f2 | sed -E 's/,?queues=[0-9]+//g'),queues=$cpu_count"
-        done < <(qm config "$vmid" | grep -E '^net[0-9]+:.*virtio')
+        done < <(echo "$vm_cfg" | grep -E '^net[0-9]+:.*virtio')
 
-        boot_disk=$(qm config "$vmid" | grep '^boot:' | sed -e 's/.*order=//' -e 's/;.*//' || true)
+        boot_disk=$(echo "$vm_cfg" | grep '^boot:' | sed -e 's/.*order=//' -e 's/;.*//' || true)
         if [[ -n "$boot_disk" ]]; then
-            if [[ "$boot_disk" =~ ^(scsi|virtio) ]]; then
-                disk_line=$(qm config "$vmid" | grep "^${boot_disk}:" || true)
-                if [[ -n "$disk_line" && "$disk_line" != *"iothread=1"* ]]; then
-                     disk_opts=$(echo "$disk_line" | cut -d' ' -f2 | cut -d',' -f2-)
-                     disk_path=$(echo "$disk_line" | cut -d' ' -f2 | cut -d',' -f1)
-                     log "  Enabling IO Thread on $boot_disk"
-                     qm set "$vmid" -"$boot_disk" "${disk_path},${disk_opts},iothread=1"
+            if [[ "$boot_disk" =~ ^scsi ]]; then
+                # iothread on a scsiX disk only takes effect with the
+                # virtio-scsi-single controller; on any other scsihw qm either
+                # rejects it or silently ignores it at VM start.
+                scsihw=$(echo "$vm_cfg" | sed -n 's/^scsihw: *//p')
+                if [[ "$scsihw" != "virtio-scsi-single" ]]; then
+                    log "  Skipping IO Thread on $boot_disk: requires scsihw=virtio-scsi-single (current: ${scsihw:-default})."
+                    boot_disk=""
                 fi
-            else
+            elif [[ ! "$boot_disk" =~ ^virtio ]]; then
                 log "  Skipping IO Thread for bus: $boot_disk (not supported)"
+                boot_disk=""
+            fi
+        fi
+        if [[ -n "$boot_disk" ]]; then
+            disk_line=$(echo "$vm_cfg" | grep "^${boot_disk}:" || true)
+            if [[ -n "$disk_line" && "$disk_line" != *"iothread=1"* ]]; then
+                disk_spec=$(echo "$disk_line" | awk '{print $2}')
+                disk_path=${disk_spec%%,*}
+                log "  Enabling IO Thread on $boot_disk"
+                if [[ "$disk_spec" == *,* ]]; then
+                    disk_opts=${disk_spec#*,}
+                    qm set "$vmid" -"$boot_disk" "${disk_path},${disk_opts},iothread=1"
+                else
+                    # No existing options: the old `cut -f2-` duplicated the
+                    # volume here ("path,path,iothread=1") and qm rejected it.
+                    qm set "$vmid" -"$boot_disk" "${disk_path},iothread=1"
+                fi
             fi
         fi
 
