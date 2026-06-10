@@ -18,6 +18,14 @@ SYSCTL_D="${SYSCTL_D:-/etc/sysctl.d}"
 KSM_RUN_FILE="${KSM_RUN_FILE:-/sys/kernel/mm/ksm/run}"
 CPUFREQ_BASE="${CPUFREQ_BASE:-/sys/devices/system/cpu}"
 PROC_CMDLINE_FILE="${PROC_CMDLINE_FILE:-/proc/cmdline}"
+# Fallback snippets dir for 'local:snippets/...' volids when pvesm cannot
+# resolve them (and the test override).
+SNIPPETS_FALLBACK_DIR="${SNIPPETS_FALLBACK_DIR:-/var/lib/vz/snippets}"
+
+# Where this script (and its bundled extras/) lives -- used by --install-hook,
+# --install-irq-service and the hook drift check.
+SCRIPT_PATH=$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || echo "$0")
+SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
 
 usage() {
     echo "Usage: $0 -f <config.json> [-n][-s <hook_script_path>] [-r] [-a [N]]"
@@ -30,6 +38,11 @@ usage() {
     echo "  -g:                    Skip GPU discovery and assignment (force CPU-only). Optional."
     echo "  -i:                    Only re-apply device IRQ confinement, then exit. Optional."
     echo "                         (For boot-time use: see extras/affinity-manager-irq.service.)"
+    echo "  --install-hook [volid]: Install/refresh extras/vcpu-pin-hook.sh on the snippets storage"
+    echo "                         and attach it to every managed VM. Default volid:"
+    echo "                         local:snippets/vcpu-pin-hook.sh (or the -s value when given)."
+    echo "  --install-irq-service: Install + enable the boot-time IRQ confinement unit, with"
+    echo "                         ExecStart generated from this script and config path."
     exit 1
 }
 
@@ -465,6 +478,9 @@ BALANCE_SOCKETS=0
 CORES_PER_NUMA=1
 SKIP_GPU=0
 CONFINE_IRQS_ONLY=0
+INSTALL_HOOK=0
+INSTALL_HOOK_VOLID=""
+INSTALL_IRQ_SERVICE=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -483,6 +499,11 @@ while [[ $# -gt 0 ]]; do
             ;;
         -g|--no-gpu) SKIP_GPU=1; shift ;;
         -i|--confine-irqs-only) CONFINE_IRQS_ONLY=1; shift ;;
+        --install-hook)
+            INSTALL_HOOK=1
+            if [[ $# -gt 1 && "$2" != -* ]]; then INSTALL_HOOK_VOLID="$2"; shift 2; else shift; fi
+            ;;
+        --install-irq-service) INSTALL_IRQ_SERVICE=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) error "Unknown option: $1" ;;
     esac
@@ -490,6 +511,15 @@ done
 
 if [[ -z "$CONFIG_FILE" ]]; then error "Configuration file (-f) is required."; fi
 if [[ ! -f "$CONFIG_FILE" ]]; then error "Configuration file not found."; fi
+# --install-hook implies attaching the hook: an explicit volid argument wins,
+# then an explicit -s, then the bundled default name on the local storage.
+if [[ $INSTALL_HOOK -eq 1 ]]; then
+    if [[ -n "$INSTALL_HOOK_VOLID" ]]; then
+        HOOK_SCRIPT_PATH="$INSTALL_HOOK_VOLID"
+    elif [[ -z "$HOOK_SCRIPT_PATH" ]]; then
+        HOOK_SCRIPT_PATH="local:snippets/vcpu-pin-hook.sh"
+    fi
+fi
 # qm only accepts hookscripts as storage volume IDs (e.g. local:snippets/hook.sh)
 # on a storage with the 'snippets' content type -- a plain filesystem path fails
 # at apply time on every VM. Catch it up front.
@@ -1329,6 +1359,119 @@ apply_host_tuning() {
     fi
 }
 
+# =============================================================================
+# --- COMPONENT INSTALLERS (--install-hook / --install-irq-service) ---
+# Opt-in flags that set up the two pieces a plain run cannot: the per-vCPU
+# pinning hookscript on the snippets storage, and the boot-time IRQ
+# re-confinement unit. Both are idempotent and honor DRY_RUN. They run in
+# Phase 3.5, i.e. only after the whole plan has validated.
+# =============================================================================
+
+# resolve_snippets_path <volid>: filesystem path behind a snippets volume ID.
+# Prefers pvesm (authoritative); falls back to the default local-storage
+# layout for 'local:snippets/...'.
+resolve_snippets_path() {
+    local volid=$1
+    local p=""
+    if command -v pvesm &> /dev/null; then
+        p=$(pvesm path "$volid" 2>/dev/null || true)
+    fi
+    if [[ -z "$p" ]]; then
+        local storage=${volid%%:*} rel=${volid#*:}
+        if [[ "$storage" == "local" && "$rel" == snippets/* ]]; then
+            p="${SNIPPETS_FALLBACK_DIR}/${rel#snippets/}"
+        fi
+    fi
+    [[ -n "$p" ]] || return 1
+    echo "$p"
+}
+
+install_hook_file() {
+    [[ $INSTALL_HOOK -eq 1 ]] || return 0
+    local src="${SCRIPT_DIR}/extras/vcpu-pin-hook.sh"
+    local volid="$HOOK_SCRIPT_PATH"
+    local target storage snippets_storages
+
+    if [[ ! -f "$src" ]]; then
+        error "--install-hook: $src not found (run from a full checkout)."
+    fi
+    target=$(resolve_snippets_path "$volid" || true)
+    if [[ -z "$target" ]]; then
+        error "--install-hook: cannot resolve a filesystem path for '$volid' (unknown storage?)."
+    fi
+
+    # Soft check: the storage should expose the 'snippets' content type, or
+    # qm will reject the hookscript later. Only meaningful when pvesm answers.
+    storage=${volid%%:*}
+    snippets_storages=$(pvesm status --content snippets 2>/dev/null | awk 'NR>1{print $1}' || true)
+    if [[ -n "$snippets_storages" ]] && ! grep -qx "$storage" <<< "$snippets_storages"; then
+        warn "  Storage '$storage' does not list the 'snippets' content type; qm may reject '$volid'."
+    fi
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        log "  [DRY RUN] Would install hook: $src -> $target (attached as '$volid')."
+        return 0
+    fi
+    if [[ -f "$target" ]] && cmp -s "$src" "$target"; then
+        log "  Hook already up to date: $target"
+        return 0
+    fi
+    if [[ -f "$target" ]]; then
+        cp -a "$target" "${target}.bak"
+        log "  Existing hook differs; previous copy saved to ${target}.bak"
+    fi
+    mkdir -p "$(dirname "$target")"
+    cp "$src" "$target"
+    chmod 755 "$target"
+    log "  Installed hook: $src -> $target (attached as '$volid')."
+}
+
+install_irq_service() {
+    [[ $INSTALL_IRQ_SERVICE -eq 1 ]] || return 0
+    local unit_dir="${SYSTEMD_ETC}/system"
+    local unit_file="${unit_dir}/affinity-manager-irq.service"
+    local config_path unit_content
+    config_path=$(realpath "$CONFIG_FILE")
+
+    unit_content="# Generated by: manager.sh --install-irq-service
+# Re-run that command to regenerate after moving this script or its config.
+#
+# /proc/irq affinity does not survive reboots (or NIC driver re-init); the
+# systemd drop-ins and GRUB params do. This oneshot unit restores the IRQ
+# placement at boot without re-running the full plan.
+
+[Unit]
+Description=Affinity Manager: confine device IRQs to reserved host cores
+# Run late so NIC/NVMe drivers have registered their IRQs.
+After=network-online.target multi-user.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${SCRIPT_PATH} -f ${config_path} --confine-irqs-only
+
+[Install]
+WantedBy=multi-user.target
+"
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        log "  [DRY RUN] Would write $unit_file (ExecStart=${SCRIPT_PATH} -f ${config_path} --confine-irqs-only),"
+        log "  [DRY RUN] then: systemctl daemon-reload && systemctl enable affinity-manager-irq.service"
+        return 0
+    fi
+    if [[ -f "$unit_file" ]] && printf '%s' "$unit_content" | cmp -s - "$unit_file"; then
+        log "  IRQ unit unchanged: $unit_file"
+    else
+        mkdir -p "$unit_dir"
+        printf '%s' "$unit_content" > "$unit_file"
+        log "  Wrote $unit_file"
+    fi
+    systemctl daemon-reload
+    systemctl enable affinity-manager-irq.service
+    log "  affinity-manager-irq.service enabled (IRQ confinement now persists across reboots)."
+}
+
 declare -A AVAILABLE_PHYS_CORES AVAILABLE_SMT_CORES
 for node_id in "${NUMA_NODE_IDS[@]}"; do
     AVAILABLE_PHYS_CORES["$node_id"]=""; AVAILABLE_SMT_CORES["$node_id"]=""
@@ -1505,7 +1648,7 @@ discover_gpus
 # =============================================================================
 log "--- PHASE 2: Reading VM Configurations ---"
 declare -A VMS_TO_CONFIGURE VM_DISK_NODE_PREFERENCE VM_DISK_NODE_SOURCE
-declare -A VM_MEMORY_MB VM_HUGEPAGE_1G_PAGES VM_HAS_HOOKSCRIPT
+declare -A VM_MEMORY_MB VM_HUGEPAGE_1G_PAGES VM_HAS_HOOKSCRIPT VM_HOOKSCRIPT_VALUE
 declare -A NODE_1G_HUGEPAGES_TOTAL NODE_1G_HUGEPAGES_PLANNED NODE_1G_HUGEPAGES_FREE
 TOTAL_CORES_REQUESTED=0
 
@@ -1569,8 +1712,9 @@ for vmid in "${!VMS_TO_CONFIGURE[@]}"; do
         vm_exists=0
         if [[ -n "$vm_cfg_snapshot" ]]; then vm_exists=1; fi
 
+        vm_hook_value=$(echo "$vm_cfg_snapshot" | sed -n 's/^hookscript: *//p' | head -n1)
         vm_has_hook=0
-        if echo "$vm_cfg_snapshot" | grep -q '^hookscript:'; then vm_has_hook=1; fi
+        if [[ -n "$vm_hook_value" ]]; then vm_has_hook=1; fi
 
         vm_mem_mb=$(echo "$vm_cfg_snapshot" | awk '/^memory:/ {print $2; exit}')
         if [[ "$vm_mem_mb" =~ ^[0-9]+$ ]] && (( vm_mem_mb > 0 )); then
@@ -1589,7 +1733,7 @@ for vmid in "${!VMS_TO_CONFIGURE[@]}"; do
             IFS='|' read -r disk_node disk_source <<< "$disk_pref_info"
         fi
 
-        printf '%s|%s|%s|%s|%s|%s|%s\n' "$vm_exists" "$vm_mem_mb" "$vm_pages_1g" "$mem_ok" "$vm_has_hook" "$disk_node" "$disk_source" > "$_p2_tmp/$vmid"
+        printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$vm_exists" "$vm_mem_mb" "$vm_pages_1g" "$mem_ok" "$vm_has_hook" "$vm_hook_value" "$disk_node" "$disk_source" > "$_p2_tmp/$vmid"
     } &
     parallel_track "VM $vmid" $!
 done
@@ -1601,9 +1745,9 @@ _missing_vms=()
 for vmid in $(printf '%s\n' "${!VMS_TO_CONFIGURE[@]}" | sort -n); do
     cores=${VMS_TO_CONFIGURE[$vmid]}
     if [[ -f "$_p2_tmp/$vmid" ]]; then
-        IFS='|' read -r vm_exists vm_mem_mb vm_pages_1g mem_ok vm_has_hook disk_node disk_source < "$_p2_tmp/$vmid"
+        IFS='|' read -r vm_exists vm_mem_mb vm_pages_1g mem_ok vm_has_hook vm_hook_value disk_node disk_source < "$_p2_tmp/$vmid"
     else
-        vm_exists=0; vm_mem_mb=0; vm_pages_1g=0; mem_ok=0; vm_has_hook=0; disk_node=""; disk_source=""
+        vm_exists=0; vm_mem_mb=0; vm_pages_1g=0; mem_ok=0; vm_has_hook=0; vm_hook_value=""; disk_node=""; disk_source=""
     fi
 
     if [[ "$vm_exists" != "1" ]]; then
@@ -1614,6 +1758,7 @@ for vmid in $(printf '%s\n' "${!VMS_TO_CONFIGURE[@]}" | sort -n); do
     VM_MEMORY_MB["$vmid"]=${vm_mem_mb:-0}
     VM_HUGEPAGE_1G_PAGES["$vmid"]=${vm_pages_1g:-0}
     VM_HAS_HOOKSCRIPT["$vmid"]=${vm_has_hook:-0}
+    VM_HOOKSCRIPT_VALUE["$vmid"]=${vm_hook_value:-}
     if [[ "$mem_ok" != "1" ]]; then
         warn "  VM $vmid: could not read memory size for hugepage planning; hugepage guard skipped for this VM."
     fi
@@ -2152,6 +2297,8 @@ log "Planning Complete."
 # The plan validates -- only now is it safe to start mutating the host.
 log "--- PHASE 3.5: Applying Host Core Pinning ---"
 apply_host_pinning
+install_hook_file
+install_irq_service
 
 
 # =============================================================================
@@ -2209,8 +2356,7 @@ post_run_checks() {
             log "  IRQ persistence: affinity-manager-irq.service is enabled."
         else
             warn "  IRQ persistence: affinity-manager-irq.service is NOT enabled -- device IRQ confinement will be lost on reboot."
-            warn "    Install: cp extras/affinity-manager-irq.service /etc/systemd/system/ (adapt the ExecStart paths),"
-            warn "    then: systemctl daemon-reload && systemctl enable affinity-manager-irq.service"
+            warn "    Set it up with: $0 -f $CONFIG_FILE --install-irq-service"
             issues=1
         fi
     fi
@@ -2230,10 +2376,32 @@ post_run_checks() {
     elif (( ${#missing_hook[@]} > 0 )); then
         warn "  Hookscript: ${#missing_hook[@]} VM(s) have NO hookscript attached: ${missing_hook[*]}"
         warn "    Without it, vCPUs float inside the shared affinity mask and helper threads stack on one core."
-        warn "    Attach with: $0 -f $CONFIG_FILE -s <storage>:snippets/vcpu-pin-hook.sh"
+        warn "    Install and attach with: $0 -f $CONFIG_FILE --install-hook"
         issues=1
     else
         log "  Hookscript: all ${#VMS_TO_CONFIGURE[@]} VM(s) have a hookscript attached."
+    fi
+
+    # 3b) Hook content drift: an attached hookscript whose installed file
+    #     differs from the bundled extras copy (e.g. the repo was updated but
+    #     the snippet was not re-installed).
+    local hook_src="${SCRIPT_DIR}/extras/vcpu-pin-hook.sh"
+    if [[ -f "$hook_src" ]]; then
+        local -A _seen_volids=()
+        local _vol _hpath
+        for _vmid in "${!VMS_TO_CONFIGURE[@]}"; do
+            _vol=${VM_HOOKSCRIPT_VALUE[$_vmid]:-}
+            if [[ -n "$_vol" ]]; then _seen_volids["$_vol"]=1; fi
+        done
+        for _vol in "${!_seen_volids[@]}"; do
+            _hpath=$(resolve_snippets_path "$_vol" 2>/dev/null || true)
+            [[ -n "$_hpath" && -f "$_hpath" ]] || continue
+            if ! cmp -s "$hook_src" "$_hpath"; then
+                warn "  Hookscript: installed copy $_hpath differs from the bundled extras/vcpu-pin-hook.sh."
+                warn "    If it is meant to be the bundled hook, refresh it with: $0 -f $CONFIG_FILE --install-hook $_vol"
+                issues=1
+            fi
+        done
     fi
 
     if (( issues == 0 )); then

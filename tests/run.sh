@@ -75,7 +75,7 @@ scenario() {
     export QM_CALL_LOG="$WORK/qm-calls.log"
     export SYSTEMCTL_CALL_LOG="$WORK/systemctl-calls.log"
     export IRQ_PROC_BASE="$WORK/fake-irq"
-    unset LSPCI_FIXTURE NVIDIA_SMI_MEM_MB QM_FAIL_SET_VMIDS SYSTEMCTL_IS_ENABLED_RC \
+    unset LSPCI_FIXTURE NVIDIA_SMI_MEM_MB QM_FAIL_SET_VMIDS SYSTEMCTL_IS_ENABLED_RC PVESM_PATH \
         QEMU_PID_DIR PROC_BASE TASKSET_CALL_LOG 2>/dev/null || true
     mkdir -p "$IRQ_PROC_BASE"
     # Hermetic-by-default host touchpoints: every override the manager honors
@@ -99,6 +99,7 @@ scenario() {
     export CPUFREQ_BASE="$WORK/fake-cpufreq"
     export PROC_CMDLINE_FILE="$WORK/fake-cmdline"
     printf 'BOOT_IMAGE=/boot/vmlinuz quiet\n' > "$PROC_CMDLINE_FILE"
+    export SNIPPETS_FALLBACK_DIR="$WORK/fake-snippets"
     # Keep the hookscript's append-log off unless a scenario opts in.
     export VCPU_PIN_LOG=""
 }
@@ -325,6 +326,58 @@ assert_grep "$WORK/run.log" "Configuration failed for VM\(s\): 102" "failed VM r
 assert_file_exists "$WORK/state.json" "state file records the attempted plan"
 assert_json "$WORK/state.json" '.metadata.applied == false' "state stays applied=false after a failed apply"
 assert_json "$WORK/state.json" '.core_assignments | length == 2' "attempted plan covers both VMs"
+
+# =============================================================================
+scenario "--install-hook and --install-irq-service set up both components"
+write_basic_config
+export QM_FIXTURE_DIR="$FIXTURES/qm-mem"
+export PVESM_PATH="$WORK/snippets/cpu-pin.sh"
+
+# Dry run first: plans the installs, touches nothing.
+run_manager -f "$WORK/config.json" -n -g --install-hook "local:snippets/cpu-pin.sh" --install-irq-service
+assert_exit_code 0 "$RUN_RC" "dry run exits 0"
+assert_grep "$WORK/run.log" "Would install hook: .*extras/vcpu-pin-hook.sh -> $WORK/snippets/cpu-pin.sh" "dry run plans the hook install"
+assert_grep "$WORK/run.log" "Would write .*affinity-manager-irq.service" "dry run plans the unit"
+assert_file_absent "$WORK/snippets/cpu-pin.sh" "dry run installs nothing"
+assert_file_absent "$WORK/fake-systemd-etc/system/affinity-manager-irq.service" "dry run writes no unit"
+
+# Apply: hook copied + attached, unit written + enabled.
+run_manager -f "$WORK/config.json" -g --install-hook "local:snippets/cpu-pin.sh" --install-irq-service
+assert_exit_code 0 "$RUN_RC" "apply exits 0"
+assert_file_exists "$WORK/snippets/cpu-pin.sh" "hook copied to the snippets path"
+if cmp -s "$ROOT/extras/vcpu-pin-hook.sh" "$WORK/snippets/cpu-pin.sh"; then
+    ok "installed hook is byte-identical to extras"
+else
+    fail "installed hook differs from extras"
+fi
+assert_grep "$WORK/qm-calls.log" "^qm set 104 --hookscript local:snippets/cpu-pin.sh$" "hook attached to managed VMs"
+UNIT_FILE="$WORK/fake-systemd-etc/system/affinity-manager-irq.service"
+assert_file_exists "$UNIT_FILE" "IRQ unit written"
+assert_grep "$UNIT_FILE" "^ExecStart=.*manager.sh -f .*config.json --confine-irqs-only$" "unit ExecStart points at this script and config"
+assert_grep "$WORK/systemctl-calls.log" "^systemctl daemon-reload$" "systemd reloaded"
+assert_grep "$WORK/systemctl-calls.log" "^systemctl enable affinity-manager-irq.service$" "unit enabled"
+assert_file_absent "$WORK/snippets/cpu-pin.sh.bak" "no backup created on first install"
+
+# Idempotence: a second apply changes nothing and says so.
+run_manager -f "$WORK/config.json" -g --install-hook "local:snippets/cpu-pin.sh" --install-irq-service
+assert_exit_code 0 "$RUN_RC" "second apply exits 0"
+assert_grep "$WORK/run.log" "Hook already up to date" "hook install is idempotent"
+assert_grep "$WORK/run.log" "IRQ unit unchanged" "unit write is idempotent"
+assert_file_absent "$WORK/snippets/cpu-pin.sh.bak" "no backup when content is identical"
+
+# Drift detection: a stale installed hook is flagged by the post-run checks
+# (the qm-mem configs carry no hookscript, so attach via -s to simulate an
+# already-hooked fleet via config snapshots instead).
+mkdir -p "$WORK/qm-hooked"
+for v in 101 102 103 104; do
+    cp "$FIXTURES/qm-mem/$v.conf" "$WORK/qm-hooked/$v.conf"
+    echo "hookscript: local:snippets/cpu-pin.sh" >> "$WORK/qm-hooked/$v.conf"
+done
+export QM_FIXTURE_DIR="$WORK/qm-hooked"
+echo "# stale old hook" > "$WORK/snippets/cpu-pin.sh"
+run_manager -f "$WORK/config.json" -n -g
+assert_grep "$WORK/run.log" "installed copy $WORK/snippets/cpu-pin.sh differs from the bundled" "stale hook drift flagged"
+assert_grep "$WORK/run.log" "refresh it with: .* --install-hook local:snippets/cpu-pin.sh" "drift warning suggests the fix"
 
 # =============================================================================
 scenario "apply preserves single-quoted GRUB_CMDLINE_LINUX_DEFAULT"
