@@ -64,7 +64,7 @@ attached. These are warnings only; they never change the exit code.
 ```json
 {
   "global_settings": {
-    "cpu_config_string": "host,flags=+aes",
+    "cpu_config_string": "host,flags=+md-clear;-pcid;-spec-ctrl;-ssbd;+pdpe1gb;+hv-tlbflush;+aes",
     "reserve_host_cores": true,
     "host_cores": [0, 44, 22, 66],
     "state_file": "/var/tmp/proxmox_cpu_affinity.state"
