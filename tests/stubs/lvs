@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Test stub: LVM/Proxmox storage queries always fail, exactly as on a CI
+# runner without LVM -- disk-locality detection must degrade to "none".
+exit 1

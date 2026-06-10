@@ -39,7 +39,9 @@ VCPU_PIN_LOG="${VCPU_PIN_LOG-/var/log/cpu-pin.log}"
 
 _logfile() {
     [[ -n "$VCPU_PIN_LOG" ]] || return 0
-    echo "$(date '+%F %T') [vm $VMID] $*" >> "$VCPU_PIN_LOG" 2>/dev/null || true
+    # 2>/dev/null FIRST: redirections apply left-to-right, so a failing
+    # append-open (missing dir, EACCES) is silenced too.
+    echo "$(date '+%F %T') [vm $VMID] $*" 2>/dev/null >> "$VCPU_PIN_LOG" || true
 }
 log()  { echo "[vcpu-pin-hook] $*"; _logfile "$*"; }
 warn() { echo "[vcpu-pin-hook] WARNING: $*" >&2; _logfile "WARNING: $*"; }
@@ -58,7 +60,9 @@ cores=()
 IFS=',' read -ra _tokens <<< "$affinity"
 for tok in "${_tokens[@]}"; do
     if [[ "$tok" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-        for (( c=BASH_REMATCH[1]; c<=BASH_REMATCH[2]; c++ )); do cores+=("$c"); done
+        # 10# forces decimal: a leading zero ("08") would otherwise be parsed
+        # as invalid octal and abort the arithmetic loop.
+        for (( c=10#${BASH_REMATCH[1]}; c<=10#${BASH_REMATCH[2]}; c++ )); do cores+=("$c"); done
     elif [[ "$tok" =~ ^[0-9]+$ ]]; then
         cores+=("$tok")
     fi
@@ -120,12 +124,16 @@ rev_cores=()
 for (( i=${#cores[@]}-1; i>=0; i-- )); do rev_cores+=("${cores[i]}"); done
 helpers=0
 helpers_failed=0
+helper_idx=0
 for task_dir in "$PROC_BASE/$pid/task"/*; do
     [[ -r "$task_dir/comm" ]] || continue
     comm=$(<"$task_dir/comm")
     [[ "$comm" =~ ^CPU\ [0-9]+/KVM$ ]] && continue
     tid=${task_dir##*/}
-    target=${rev_cores[$(( helpers % ${#rev_cores[@]} ))]}
+    # Index by attempt, not by success: a transient thread exiting mid-pin
+    # must not make every subsequent helper retarget the same core.
+    target=${rev_cores[$(( helper_idx % ${#rev_cores[@]} ))]}
+    helper_idx=$((helper_idx + 1))
     if taskset -pc "$target" "$tid" > /dev/null 2>&1; then
         log "VM $VMID helper '$comm' (tid $tid) -> CPU $target"
         helpers=$((helpers + 1))

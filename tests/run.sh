@@ -75,18 +75,28 @@ scenario() {
     export QM_CALL_LOG="$WORK/qm-calls.log"
     export SYSTEMCTL_CALL_LOG="$WORK/systemctl-calls.log"
     export IRQ_PROC_BASE="$WORK/fake-irq"
-    unset LSPCI_FIXTURE NVIDIA_SMI_MEM_MB GRUB_FILE SYSTEMD_ETC LOCK_FILE \
+    unset LSPCI_FIXTURE NVIDIA_SMI_MEM_MB QM_FAIL_SET_VMIDS \
         QEMU_PID_DIR PROC_BASE TASKSET_CALL_LOG 2>/dev/null || true
     mkdir -p "$IRQ_PROC_BASE"
-    # Hermetic-by-default /sys trees: EMPTY fakes, so a real host's GPUs or
-    # hugepage pools can never leak into a scenario. (Previously these were
-    # merely unset and fell back to the real /sys -- scenarios that relied on
-    # "no mdev support" or "no hugepage pool" passed in CI containers but
-    # failed on actual vGPU hosts.) make_gpu / make_node_hugepages populate
-    # these same paths.
-    export PCI_SYS_BASE="$WORK/fake-pci"
-    export NODE_SYS_BASE="$WORK/fake-node"
+    # Hermetic-by-default host touchpoints: every override the manager honors
+    # points at a fresh fake under $WORK, so nothing a scenario does (or
+    # forgets to do) can read or touch the real host. Previously several of
+    # these were merely unset and fell back to the real paths -- scenarios
+    # that relied on "no mdev support" or "no hugepage pool" passed in CI
+    # containers but failed on actual vGPU hosts, every scenario flocked the
+    # REAL /run/lock/affinity-manager.lock (colliding with production runs),
+    # and dry-run logs quoted the real /etc/default/grub.
+    export PCI_SYS_BASE="$WORK/fake-pci"          # make_gpu populates
+    export NODE_SYS_BASE="$WORK/fake-node"        # make_node_hugepages populates
     mkdir -p "$PCI_SYS_BASE" "$NODE_SYS_BASE"
+    export LOCK_FILE="$WORK/lock"
+    export GRUB_FILE="$WORK/fake-grub"
+    printf 'GRUB_CMDLINE_LINUX_DEFAULT="quiet"\n' > "$GRUB_FILE"
+    export SYSTEMD_ETC="$WORK/fake-systemd-etc"
+    export PROC_SYS_BASE="$WORK/fake-procsys"
+    export SYSCTL_D="$WORK/fake-sysctld"
+    export KSM_RUN_FILE="$WORK/fake-ksm-run"
+    export CPUFREQ_BASE="$WORK/fake-cpufreq"
     # Keep the hookscript's append-log off unless a scenario opts in.
     export VCPU_PIN_LOG=""
 }
@@ -261,6 +271,25 @@ assert_grep "$WORK/qm-calls.log" "^qm set 104 -scsi0 local-lvm:vm-104-disk-0,siz
 assert_file_exists "$WORK/state.json" "state written to configured state_file path"
 assert_json "$WORK/state.json" '.core_assignments | length == 4' "state covers all VMs"
 assert_json "$WORK/state.json" '.metadata.applied == true' "state is marked applied after a successful apply"
+
+# =============================================================================
+scenario "a failed qm set leaves the state file marked applied=false"
+cat > "$WORK/config.json" <<EOF
+{
+  "global_settings": { "reserve_host_cores": true, "host_cores": [0, 8], "state_file": "$WORK/state.json" },
+  "disk_settings": { "storage_node_map": { "local-lvm": "node:0" } },
+  "vms": { "101": 2, "102": 2 }
+}
+EOF
+export QM_FIXTURE_DIR="$FIXTURES/qm-mem"
+export QM_FAIL_SET_VMIDS="102"
+run_manager -f "$WORK/config.json" -g
+
+assert_exit_code 1 "$RUN_RC" "apply exits non-zero"
+assert_grep "$WORK/run.log" "Configuration failed for VM\(s\): 102" "failed VM reported"
+assert_file_exists "$WORK/state.json" "state file records the attempted plan"
+assert_json "$WORK/state.json" '.metadata.applied == false' "state stays applied=false after a failed apply"
+assert_json "$WORK/state.json" '.core_assignments | length == 2' "attempted plan covers both VMs"
 
 # =============================================================================
 scenario "apply preserves single-quoted GRUB_CMDLINE_LINUX_DEFAULT"

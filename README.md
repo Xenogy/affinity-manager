@@ -143,8 +143,15 @@ bundled hookscript fixes both at every VM start:
   housekeeping) is pinned round-robin over the affinity cores in **reverse** order,
   so helpers land away from vCPU 0's core first instead of stacking on it.
 
+Threads the VM spawns *after* the hook ran (QEMU thread-pool / io_uring workers)
+inherit their parent's single-CPU pin rather than the full mask — still inside the
+VM's own cores, and better than the pre-hook behavior where they all landed on one
+core. Re-running the hook by hand (`cpu-pin.sh <vmid> post-start`) redistributes
+them at any time.
+
 Besides stdout (captured in the Proxmox VM-start task log) the hook appends to
-`/var/log/cpu-pin.log`; set `VCPU_PIN_LOG=` (empty) to disable that.
+`/var/log/cpu-pin.log`; set `VCPU_PIN_LOG=` (empty) to disable that — and give it
+a logrotate entry if your VMs restart frequently.
 
 ```bash
 cp extras/vcpu-pin-hook.sh /var/lib/vz/snippets/
