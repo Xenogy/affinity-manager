@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Test stub for Proxmox qm. Serves VM configs from $QM_FIXTURE_DIR:
+#   <vmid>.conf     -> output of `qm config <vmid>` (absence = VM does not exist)
+#   <vmid>.status   -> output of `qm status <vmid>` (default: "status: stopped")
+#   <vmid>.pending  -> output of `qm pending <vmid>` (default: empty)
+# Every invocation is appended to $QM_CALL_LOG when set, so tests can assert
+# exactly what would have been applied to each VM.
+set -euo pipefail
+
+dir="${QM_FIXTURE_DIR:?QM_FIXTURE_DIR not set}"
+if [[ -n "${QM_CALL_LOG:-}" ]]; then
+    printf 'qm %s\n' "$*" >> "$QM_CALL_LOG"
+fi
+
+cmd="${1:-}"; shift || true
+vmid="${1:-}"
+
+vm_exists() { [[ -n "$vmid" && -f "$dir/$vmid.conf" ]]; }
+
+case "$cmd" in
+    config)
+        if vm_exists; then
+            cat "$dir/$vmid.conf"
+        else
+            echo "Configuration file 'nodes/test/qemu-server/${vmid}.conf' does not exist" >&2
+            exit 2
+        fi
+        ;;
+    status)
+        if vm_exists; then
+            if [[ -f "$dir/$vmid.status" ]]; then cat "$dir/$vmid.status"; else echo "status: stopped"; fi
+        else
+            echo "Configuration file 'nodes/test/qemu-server/${vmid}.conf' does not exist" >&2
+            exit 2
+        fi
+        ;;
+    pending)
+        if vm_exists; then
+            if [[ -f "$dir/$vmid.pending" ]]; then cat "$dir/$vmid.pending"; fi
+        else
+            exit 2
+        fi
+        ;;
+    set)
+        vm_exists || exit 2
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Test stub for systemctl. Records every call to $SYSTEMCTL_CALL_LOG (when set)
+# and reports every unit as inactive for `is-active`.
+set -euo pipefail
+if [[ -n "${SYSTEMCTL_CALL_LOG:-}" ]]; then
+    printf 'systemctl %s\n' "$*" >> "$SYSTEMCTL_CALL_LOG"
+fi
+case "${1:-}" in
+    is-active) exit 3 ;;
+    *) exit 0 ;;
+esac

@@ -11,11 +11,16 @@ detection, and applying each VM's `qm` config — runs in parallel across a boun
 pool, so runtime scales with the slowest VM rather than the sum of all of them. The
 NUMA-aware planning step stays sequential (each placement depends on the previous one).
 
+Everything is validated **before** anything is mutated: VM existence, core counts,
+host-core topology and plan feasibility are checked first, and host pinning (systemd
+slices, GRUB, IRQ confinement) is only applied once the whole plan is known good.
+Concurrent runs are serialized with a lock.
+
 ## Requirements
 
 `qm`, `jq`, `lscpu`, `lspci`, and `bc` on the host — a standard Proxmox node with the
-NVIDIA vGPU drivers already has these. (`nvidia-smi`, `lsblk`, and the LVM tools are
-used automatically when present.)
+NVIDIA vGPU drivers already has these. (`nvidia-smi`, `lsblk`, `flock`, and the LVM
+tools are used automatically when present.)
 
 ## Usage
 
@@ -27,6 +32,10 @@ used automatically when present.)
 sudo ./manager.sh -f config.json
 ```
 
+If any configured VM is running, its changes land as Proxmox *pending* changes; the
+script ends with an explicit list of VMs that must be power-cycled before the new
+layout takes effect.
+
 ### Options
 
 | Flag | Description |
@@ -36,7 +45,8 @@ sudo ./manager.sh -f config.json
 | `-a [N]` | Auto-select host cores, consolidated on the least GPU-loaded NUMA node (N per node, default 1). |
 | `-b [N]` | Auto-select host cores, balanced across physical sockets (N physical + N SMT per socket). |
 | `-g` | Skip GPU discovery and assignment — CPU-only. |
-| `-s <script>` | Attach a hook script to each VM. |
+| `-i` | Only re-apply device IRQ confinement, then exit (see persistence below). |
+| `-s <volume-id>` | Attach a hook script to each VM (a snippets volume ID, e.g. `local:snippets/vcpu-pin-hook.sh`). |
 | `-r` | Print the commands to undo host core pinning. |
 | `-h` | Show usage and exit. |
 
@@ -49,7 +59,8 @@ sudo ./manager.sh -f config.json
   "global_settings": {
     "cpu_config_string": "host,flags=+aes",
     "reserve_host_cores": true,
-    "host_cores": [0, 44, 22, 66]
+    "host_cores": [0, 44, 22, 66],
+    "state_file": "/var/tmp/proxmox_cpu_affinity.state"
   },
   "gpu_settings": {
     "required_vram_mb": 2048,
@@ -57,6 +68,11 @@ sudo ./manager.sh -f config.json
     "gpu_profile_map": {
       "0000:04:00.0": "nvidia-47"
     }
+  },
+  "tuning_settings": {
+    "disable_numa_balancing": true,
+    "disable_ksm": true,
+    "cpu_governor": "performance"
   },
   "vms": {
     "101": 4,
@@ -69,6 +85,10 @@ sudo ./manager.sh -f config.json
 - `cpu_config_string` — CPU type and flags passed to the VMs.
 - `reserve_host_cores` — keep `host_cores` for the host and pin VMs off them.
 - `host_cores` — CPU IDs reserved for the host (or leave it and use `-a`/`-b`).
+  Entries are validated against the actual topology.
+- `state_file` — where the plan record is written (default `manager_state.json`).
+  Dry runs write to `<state_file>.dryrun` so a preview never overwrites the record
+  of the last real apply.
 - `parallel_jobs` — max concurrent jobs for GPU probing, disk detection, and VM
   config. Optional; defaults to the host CPU count (`nproc`). Set to `1` to force
   fully sequential execution.
@@ -78,12 +98,61 @@ sudo ./manager.sh -f config.json
 - `auto_detect_profile` — pick the vGPU profile by VRAM automatically.
 - `gpu_profile_map` — pin a specific vGPU profile to a GPU by PCI address.
 
+**tuning_settings** (all optional, all default off — they change host-global behavior)
+- `disable_numa_balancing` — automatic NUMA balancing migrates tasks/pages to chase
+  locality the plan has already fixed; disabling it removes that overhead. Applied
+  live and persisted via `/etc/sysctl.d/`.
+- `disable_ksm` — KSM cannot merge hugetlbfs-backed guests, so with 1G hugepages
+  ksmd/ksmtuned is pure CPU overhead on the host cores. Stops both and unmerges.
+- `cpu_governor` — cpufreq governor to set on the VM cores (e.g. `"performance"`).
+
 **vms** — map of VM ID to the number of cores it gets. Each VM targets one vGPU slot
 (falling back to CPU-only if none fits, or always with `-g`).
 
 Disk locality is detected automatically. To hint it, add an optional `disk_settings`
 block mapping a VM or storage to a node, e.g.
 `{ "disk_settings": { "vm_node_map": { "101": "node:0" } } }`.
+
+## How VMs are kept on their cores
+
+- Each VM gets `qm set -affinity` with its planned cores: physical cores first, and
+  when SMT threads are needed, the **siblings of that VM's own physical cores** — so
+  both threads of a core belong to one VM and no other VM shares its pipeline.
+  Physical-vs-SMT classification comes from the lscpu core map, so interleaved
+  sibling numbering (AMD EPYC style) is handled correctly.
+- The host slices (`system.slice`, `user.slice`, `init.scope`) are restricted to the
+  reserved host cores, and `qemu.slice` (where Proxmox actually runs QEMU guests)
+  gets an `AllowedCPUs=` drop-in for the VM cores — this also keeps VMs that are
+  *not* in the config off the host cores.
+- GRUB gets `isolcpus=managed_irq,domain`, `nohz_full` and `rcu_nocbs` for the VM
+  cores (run `update-grub` and reboot to activate).
+- Movable device IRQs that overlap VM cores are steered onto the host cores.
+
+### Per-vCPU 1:1 pinning (extras/vcpu-pin-hook.sh)
+
+`qm`'s affinity is one shared mask for every thread of the VM — vCPUs migrate within
+it and compete with the QEMU main loop and iothreads. The bundled hookscript adds
+libvirt-style vcpupin at every VM start: vCPU *k* is pinned to the *k*-th CPU of the
+affinity list, while the emulator/iothreads keep the shared mask.
+
+```bash
+cp extras/vcpu-pin-hook.sh /var/lib/vz/snippets/
+chmod +x /var/lib/vz/snippets/vcpu-pin-hook.sh
+sudo ./manager.sh -f config.json -s local:snippets/vcpu-pin-hook.sh
+```
+
+### IRQ confinement persistence (extras/affinity-manager-irq.service)
+
+`/proc/irq` affinity resets on every reboot (and on NIC driver re-init). The systemd
+drop-ins and GRUB params persist, the IRQ placement does not — re-apply it with
+`manager.sh -f config.json -i`, or install the bundled oneshot unit to do it at boot:
+
+```bash
+cp manager.sh /usr/local/sbin/affinity-manager.sh
+mkdir -p /etc/affinity-manager && cp config.json /etc/affinity-manager/
+cp extras/affinity-manager-irq.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable affinity-manager-irq.service
+```
 
 ## Examples
 
@@ -96,4 +165,21 @@ sudo ./manager.sh -f config.json -b 2
 
 # CPU-only, no GPU assignment
 sudo ./manager.sh -f config.json -g
+
+# Re-apply IRQ confinement after a NIC reset
+sudo ./manager.sh -f config.json -i
 ```
+
+## Tests
+
+`tests/run.sh` runs the full pipeline end-to-end with `qm`, `lscpu`, `lspci`,
+`systemctl`, `nvidia-smi` and `taskset` stubbed via `PATH`, and every `/etc` and
+`/sys` touchpoint redirected at fixture trees — including the real (non-dry-run)
+apply path, GPU slot pairing, SMT sibling allocation, and failure-ordering
+guarantees. Runs in any container:
+
+```bash
+sudo bash tests/run.sh
+```
+
+CI (GitHub Actions) runs `shellcheck` and the harness on every push.

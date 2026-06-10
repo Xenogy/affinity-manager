@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Test stub for lscpu. Emits the topology fixture named by $LSCPU_TOPOLOGY.
+# Supports the two invocations manager.sh uses:
+#   lscpu -p=CPU,CORE,SOCKET,NODE
+#   lscpu -p=CPU,CORE
+set -euo pipefail
+
+topo_file="${LSCPU_TOPOLOGY:?LSCPU_TOPOLOGY not set (path to fixture)}"
+
+case "$*" in
+    *-p=CPU,CORE,SOCKET,NODE*)
+        echo "# CPU,Core,Socket,Node"
+        cat "$topo_file"
+        ;;
+    *-p=CPU,CORE*)
+        echo "# CPU,Core"
+        cut -d',' -f1,2 "$topo_file"
+        ;;
+    *)
+        echo "lscpu stub: unsupported invocation: $*" >&2
+        exit 1
+        ;;
+esac

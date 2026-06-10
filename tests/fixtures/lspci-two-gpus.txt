@@ -1,0 +1,2 @@
+0000:04:00.0 VGA compatible controller [0300]: NVIDIA Corporation TU104GL [Tesla T4] [10de:1eb8] (rev a1)
+0000:84:00.0 VGA compatible controller [0300]: NVIDIA Corporation TU104GL [Tesla T4] [10de:1eb8] (rev a1)

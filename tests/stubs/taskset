@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Test stub for taskset. Records every call to $TASKSET_CALL_LOG when set.
+set -euo pipefail
+if [[ -n "${TASKSET_CALL_LOG:-}" ]]; then
+    printf 'taskset %s\n' "$*" >> "$TASKSET_CALL_LOG"
+fi
+exit 0

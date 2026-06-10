@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Bash syntax check
+        run: |
+          bash -n manager.sh
+          bash -n extras/vcpu-pin-hook.sh
+          bash -n tests/run.sh
+      - name: shellcheck (error severity)
+        run: shellcheck -S error manager.sh extras/vcpu-pin-hook.sh tests/run.sh tests/stubs/*
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq bc
+      # The harness stubs qm/lscpu/lspci/systemctl/nvidia-smi/taskset via PATH
+      # and redirects every /etc and /sys touchpoint at fake trees, so the full
+      # discovery -> planning -> apply pipeline runs in the runner. Root is
+      # needed because the non-dry-run scenarios exercise the real apply path.
+      - name: Run end-to-end harness
+        run: sudo bash tests/run.sh

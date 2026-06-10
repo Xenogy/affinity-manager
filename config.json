@@ -8,13 +8,7 @@
       22,
       66
     ],
-    "state_file": "/var/tmp/proxmox_cpu_affinity.state",
-    "core_definitions": {
-      "physical_start": 0,
-      "physical_end": 43,
-      "logical_start": 44,
-      "logical_end": 87
-    }
+    "state_file": "/var/tmp/proxmox_cpu_affinity.state"
   },
   "gpu_settings": {
     "required_vram_mb": 2048,
@@ -30,5 +24,3 @@
     "104": 4
   }
 }
-
-
