@@ -491,6 +491,22 @@ for cmd in qm lscpu jq bc lspci; do
     if ! command -v "$cmd" &> /dev/null; then error "Required command '$cmd' not found."; fi
 done
 
+# --- SINGLE-INSTANCE LOCK ---
+# Two concurrent runs race on the config backup, the systemd/GRUB writes, and
+# GPU slot accounting. Serialize via flock; LOCK_FILE is overridable for tests.
+LOCK_FILE="${LOCK_FILE:-/run/lock/affinity-manager.lock}"
+if command -v flock &> /dev/null; then
+    # Probe writability in a subshell: putting 2>/dev/null on the real exec
+    # would permanently redirect the script's stderr along with fd 9.
+    if ! ( exec 9>"$LOCK_FILE" ) 2>/dev/null; then
+        LOCK_FILE="/tmp/affinity-manager.lock"
+    fi
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || error "Another instance is already running (lock: $LOCK_FILE)."
+else
+    warn "flock not available; concurrent runs are not guarded against."
+fi
+
 # Handle host core pinning reset
 if [[ $RESET_HOST_PINNING -eq 1 ]]; then
     log "Resetting all host core pinning..."
@@ -948,6 +964,11 @@ confine_device_irqs() {
 if [[ "$RESERVE_HOST_CORES" == "true" ]]; then
     if [[ "$HOST_CORES_JSON" != "[]" && "$HOST_CORES_JSON" != "null" ]]; then
         while IFS= read -r core_id; do
+            # A config copied from another machine (or a typo) must fail here,
+            # not halfway through a systemctl call.
+            if [[ ! "$core_id" =~ ^[0-9]+$ ]] || [[ ! -v CPU_TO_NODE["$core_id"] ]]; then
+                error "host_cores entry '$core_id' is not a CPU on this host (valid: 0-$SMT_END)."
+            fi
             CORES_TO_RESERVE+=("$core_id"); CORES_TO_RESERVE_MAP["$core_id"]=1
         done < <(echo "$HOST_CORES_JSON" | jq -r '.[]')
     else
@@ -961,8 +982,18 @@ if [[ "$RESERVE_HOST_CORES" == "true" ]]; then
         done
     fi
 
-    # Apply/output host core pinning
     if [[ ${#CORES_TO_RESERVE[@]} -gt 0 ]]; then
+        log "Host core reservation: ${CORES_TO_RESERVE[*]} (host pinning is applied only after the VM plan validates)."
+    fi
+fi
+
+# Apply host core pinning (systemd slices, GRUB params, IRQ confinement).
+# Called AFTER planning succeeds: previously this ran during Phase 1, so a
+# typo'd VMID or an infeasible plan aborted the run with the host already
+# half-reconfigured.
+apply_host_pinning() {
+    if [[ "$RESERVE_HOST_CORES" != "true" || ${#CORES_TO_RESERVE[@]} -eq 0 ]]; then return 0; fi
+    {
         host_cores_string=$(IFS=' '; echo "${CORES_TO_RESERVE[*]}")
 
         # Build the inverse set (all non-reserved cores) for the VM slice
@@ -1163,8 +1194,8 @@ EOF
         # driver/link reset -- re-run after device init or such events. (The
         # systemd drop-ins and GRUB params above persist; this placement does not.)
         confine_device_irqs
-    fi
-fi
+    }
+}
 
 declare -A AVAILABLE_PHYS_CORES AVAILABLE_SMT_CORES
 for node_id in "${NUMA_NODE_IDS[@]}"; do
@@ -1344,7 +1375,7 @@ discover_gpus
 log "--- PHASE 2: Reading VM Configurations ---"
 declare -A VMS_TO_CONFIGURE VM_DISK_NODE_PREFERENCE VM_DISK_NODE_SOURCE
 declare -A VM_MEMORY_MB VM_HUGEPAGE_1G_PAGES
-declare -A NODE_1G_HUGEPAGES_TOTAL NODE_1G_HUGEPAGES_PLANNED
+declare -A NODE_1G_HUGEPAGES_TOTAL NODE_1G_HUGEPAGES_PLANNED NODE_1G_HUGEPAGES_FREE
 TOTAL_CORES_REQUESTED=0
 
 HUGEPAGE_NODE_SAFETY_PAGES=$(jq -r '.global_settings.hugepage_node_safety_pages // 2' "$CONFIG_FILE")
@@ -1354,27 +1385,43 @@ fi
 log "  Hugepage node safety margin: ${HUGEPAGE_NODE_SAFETY_PAGES} x 1G page(s)."
 
 for node_id in "${NUMA_NODE_IDS[@]}"; do
-    hp_file="${NODE_SYS_BASE}/node${node_id}/hugepages/hugepages-1048576kB/nr_hugepages"
+    hp_dir="${NODE_SYS_BASE}/node${node_id}/hugepages/hugepages-1048576kB"
     NODE_1G_HUGEPAGES_PLANNED["$node_id"]=0
-    if [[ -f "$hp_file" ]]; then
-        hp_total=$(cat "$hp_file" 2>/dev/null || echo "-1")
+    NODE_1G_HUGEPAGES_TOTAL["$node_id"]=-1
+    NODE_1G_HUGEPAGES_FREE["$node_id"]=-1
+    if [[ -f "$hp_dir/nr_hugepages" ]]; then
+        hp_total=$(cat "$hp_dir/nr_hugepages" 2>/dev/null || echo "-1")
         if [[ "$hp_total" =~ ^[0-9]+$ ]]; then
             NODE_1G_HUGEPAGES_TOTAL["$node_id"]=$hp_total
-        else
-            NODE_1G_HUGEPAGES_TOTAL["$node_id"]=-1
         fi
-    else
-        NODE_1G_HUGEPAGES_TOTAL["$node_id"]=-1
+    fi
+    # Free pages matter too: nr_hugepages counts pages already consumed by
+    # running VMs (including ones outside this config), which the planner
+    # cannot reclaim.
+    if [[ -f "$hp_dir/free_hugepages" ]]; then
+        hp_free=$(cat "$hp_dir/free_hugepages" 2>/dev/null || echo "-1")
+        if [[ "$hp_free" =~ ^[0-9]+$ ]]; then
+            NODE_1G_HUGEPAGES_FREE["$node_id"]=$hp_free
+        fi
     fi
 done
 
 # Cheap serial pass: VM core counts and the running total come straight from the
 # config (jq), no per-VM subprocess latency, and the total must accumulate in order.
 for vmid in $(jq -r '.vms | keys[]' "$CONFIG_FILE"); do
+    if [[ ! "$vmid" =~ ^[0-9]+$ ]]; then
+        error "Invalid VM ID '$vmid' in config (must be numeric)."
+    fi
     cores=$(jq -r --arg vmid "$vmid" '.vms[$vmid]' "$CONFIG_FILE")
+    if [[ ! "$cores" =~ ^[0-9]+$ ]] || (( cores < 1 )); then
+        error "VM $vmid: invalid core count '$cores' in config (must be a positive integer)."
+    fi
     VMS_TO_CONFIGURE["$vmid"]="$cores"
     TOTAL_CORES_REQUESTED=$((TOTAL_CORES_REQUESTED + cores))
 done
+if (( ${#VMS_TO_CONFIGURE[@]} == 0 )); then
+    error "No VMs defined in config (.vms is empty)."
+fi
 
 # Parallel pass: per-VM memory read (qm config) and disk-locality detection are
 # latency-bound (qm/pvesm/lsblk/lvs/vgs) and fully independent across VMs. Each
@@ -1384,6 +1431,11 @@ parallel_begin "Disk/memory detection" "${#VMS_TO_CONFIGURE[@]}"
 for vmid in "${!VMS_TO_CONFIGURE[@]}"; do
     parallel_throttle
     {
+        # Existence first: a typo'd VMID must abort the run before anything is
+        # mutated, not surface as a pile of qm errors at the very end.
+        vm_exists=0
+        if qm config "$vmid" > /dev/null 2>&1; then vm_exists=1; fi
+
         vm_mem_mb=$(qm config "$vmid" 2>/dev/null | awk '/^memory:/ {print $2; exit}')
         if [[ "$vm_mem_mb" =~ ^[0-9]+$ ]] && (( vm_mem_mb > 0 )); then
             mem_ok=1
@@ -1401,7 +1453,7 @@ for vmid in "${!VMS_TO_CONFIGURE[@]}"; do
             IFS='|' read -r disk_node disk_source <<< "$disk_pref_info"
         fi
 
-        printf '%s|%s|%s|%s|%s\n' "$vm_mem_mb" "$vm_pages_1g" "$mem_ok" "$disk_node" "$disk_source" > "$_p2_tmp/$vmid"
+        printf '%s|%s|%s|%s|%s|%s\n' "$vm_exists" "$vm_mem_mb" "$vm_pages_1g" "$mem_ok" "$disk_node" "$disk_source" > "$_p2_tmp/$vmid"
     } &
     parallel_track "VM $vmid" $!
 done
@@ -1409,12 +1461,18 @@ parallel_drain
 
 # Collect results back into the global arrays in sorted order (logs stay readable
 # and ordered exactly as in the sequential version).
+_missing_vms=()
 for vmid in $(printf '%s\n' "${!VMS_TO_CONFIGURE[@]}" | sort -n); do
     cores=${VMS_TO_CONFIGURE[$vmid]}
     if [[ -f "$_p2_tmp/$vmid" ]]; then
-        IFS='|' read -r vm_mem_mb vm_pages_1g mem_ok disk_node disk_source < "$_p2_tmp/$vmid"
+        IFS='|' read -r vm_exists vm_mem_mb vm_pages_1g mem_ok disk_node disk_source < "$_p2_tmp/$vmid"
     else
-        vm_mem_mb=0; vm_pages_1g=0; mem_ok=0; disk_node=""; disk_source=""
+        vm_exists=0; vm_mem_mb=0; vm_pages_1g=0; mem_ok=0; disk_node=""; disk_source=""
+    fi
+
+    if [[ "$vm_exists" != "1" ]]; then
+        _missing_vms+=("$vmid")
+        continue
     fi
 
     VM_MEMORY_MB["$vmid"]=${vm_mem_mb:-0}
@@ -1432,6 +1490,10 @@ for vmid in $(printf '%s\n' "${!VMS_TO_CONFIGURE[@]}" | sort -n); do
     fi
 done
 rm -rf "$_p2_tmp"
+
+if (( ${#_missing_vms[@]} > 0 )); then
+    error "VM(s) not found on this node: ${_missing_vms[*]}. No changes were applied."
+fi
 
 adjust_gpu_slots_for_running_vms() {
     if [[ $SKIP_GPU -eq 1 ]]; then return; fi
@@ -1904,13 +1966,23 @@ fi
 for node_id in "${NUMA_NODE_IDS[@]}"; do
     node_hp_total=${NODE_1G_HUGEPAGES_TOTAL[$node_id]:--1}
     node_hp_planned=${NODE_1G_HUGEPAGES_PLANNED[$node_id]:-0}
+    node_hp_free=${NODE_1G_HUGEPAGES_FREE[$node_id]:--1}
     if (( node_hp_total >= 0 )); then
-        log "  Node $node_id hugepages(1G): planned=${node_hp_planned}, total=${node_hp_total}, safety_margin=${HUGEPAGE_NODE_SAFETY_PAGES}"
+        log "  Node $node_id hugepages(1G): planned=${node_hp_planned}, total=${node_hp_total}, free=${node_hp_free}, safety_margin=${HUGEPAGE_NODE_SAFETY_PAGES}"
+        if (( node_hp_free >= 0 && node_hp_planned > node_hp_free )); then
+            warn "  Node $node_id: plan needs ${node_hp_planned}x1G hugepages but only ${node_hp_free} are free right now. Pages held by VMs being reconfigured free up when they restart; pages held by VMs outside this config do not -- starts may fail until then."
+        fi
+    elif (( node_hp_planned > 0 )); then
+        warn "  Node $node_id: ${node_hp_planned}x1G hugepages planned, but this node exposes no 1G hugepage pool. VMs are configured with 'hugepages: 1024' and will not start until 1G pages exist (e.g. default_hugepagesz=1G hugepagesz=1G hugepages=N on the kernel cmdline)."
     fi
 done
 
 create_state_file
 log "Planning Complete."
+
+# The plan validates -- only now is it safe to start mutating the host.
+log "--- PHASE 3.5: Applying Host Core Pinning ---"
+apply_host_pinning
 
 
 # =============================================================================
@@ -2005,6 +2077,19 @@ execute_one_vm() {
         fi
 
         if [[ -n "$HOOK_SCRIPT_PATH" ]]; then qm set "$vmid" --hookscript "$HOOK_SCRIPT_PATH"; fi
+
+        # qm set on a RUNNING VM stages most of these options as "pending"
+        # changes that only take effect at the next power cycle. Detect that
+        # and say so, instead of implying the new pinning is already live.
+        local vm_status pending_count
+        vm_status=$(qm status "$vmid" 2>/dev/null | awk '{print $2}' || true)
+        if [[ "$vm_status" == "running" ]]; then
+            pending_count=$(qm pending "$vmid" 2>/dev/null | grep -cE '^[[:space:]]*(pending|delete)' || true)
+            if [[ "$pending_count" =~ ^[0-9]+$ ]] && (( pending_count > 0 )); then
+                touch "${_p4_tmp}/${vmid}.restart"
+                warn "  VM $vmid is running: $pending_count change(s) are PENDING until it is power-cycled."
+            fi
+        fi
     else
         log "  [DRY RUN] Set Affinity: $affinity (Node $node)"
         if [[ -n "$gpu_pci" ]]; then
@@ -2031,14 +2116,20 @@ done
 parallel_drain
 
 _p4_failed=()
+_p4_restart=()
 for vmid in $(printf '%s\n' "${!VMS_TO_CONFIGURE[@]}" | sort -n); do
-    [[ -f "$_p4_tmp/${vmid}.log" ]] && replay_captured "$_p4_tmp/${vmid}.log"
+    if [[ -f "$_p4_tmp/${vmid}.log" ]]; then replay_captured "$_p4_tmp/${vmid}.log"; fi
+    if [[ -f "$_p4_tmp/${vmid}.restart" ]]; then _p4_restart+=("$vmid"); fi
     [[ -f "$_p4_tmp/${vmid}.ok" ]] || _p4_failed+=("$vmid")
 done
 rm -rf "$_p4_tmp"
 
 if (( ${#_p4_failed[@]} > 0 )); then
     error "Configuration failed for VM(s): ${_p4_failed[*]}"
+fi
+
+if (( ${#_p4_restart[@]} > 0 )); then
+    warn "PENDING CHANGES: VM(s) ${_p4_restart[*]} are running and must be power-cycled (qm shutdown <id> && qm start <id>) before the new affinity/NUMA/GPU layout takes effect."
 fi
 
 log "Script finished."

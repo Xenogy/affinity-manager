@@ -75,7 +75,7 @@ scenario() {
     export QM_CALL_LOG="$WORK/qm-calls.log"
     export SYSTEMCTL_CALL_LOG="$WORK/systemctl-calls.log"
     export IRQ_PROC_BASE="$WORK/fake-irq"
-    unset LSPCI_FIXTURE NVIDIA_SMI_MEM_MB PCI_SYS_BASE NODE_SYS_BASE GRUB_FILE SYSTEMD_ETC 2>/dev/null || true
+    unset LSPCI_FIXTURE NVIDIA_SMI_MEM_MB PCI_SYS_BASE NODE_SYS_BASE GRUB_FILE SYSTEMD_ETC LOCK_FILE 2>/dev/null || true
     mkdir -p "$IRQ_PROC_BASE"
 }
 
@@ -90,11 +90,12 @@ make_gpu() {
     export PCI_SYS_BASE="$WORK/fake-pci"
 }
 
-# make_node_hugepages <node> <nr_1g_pages>: fake NUMA-node hugepage sysfs
+# make_node_hugepages <node> <nr_1g_pages> [free_pages]: fake NUMA-node hugepage sysfs
 make_node_hugepages() {
     local d="$WORK/fake-node/node$1/hugepages/hugepages-1048576kB"
     mkdir -p "$d"
     echo "$2" > "$d/nr_hugepages"
+    echo "${3:-$2}" > "$d/free_hugepages"
     export NODE_SYS_BASE="$WORK/fake-node"
 }
 
@@ -275,12 +276,13 @@ cat > "$WORK/config.json" <<'EOF'
   "vms": { "101": 2 }
 }
 EOF
+export SYSTEMD_ETC="$WORK/sysd"
 run_manager -f "$WORK/config.json" -n -g
 
 assert_exit_code 1 "$RUN_RC" "exits 1"
-assert_grep "$WORK/run.log" "Reserved host cores cover every CPU" "explains the empty VM-core set"
 assert_grep "$WORK/run.log" "no NUMA node has enough free cores" "planner reports the real problem"
 assert_not_grep "$WORK/run.log" "unbound variable" "no bash crash"
+assert_file_absent "$WORK/sysd" "host pinning never applied when the plan fails"
 
 # =============================================================================
 scenario "gpu pairing assigns NUMA-local slots with disk-locality preference"
@@ -321,6 +323,104 @@ assert_exit_code 0 "$RUN_RC" "exits 0"
 assert_grep "$WORK/run.log" "Least GPU-loaded NUMA node: Node 1" "auto-detected GPUs drive node selection (was: always node 0)"
 assert_grep "$WORK/run.log" "DRY RUN: Would update host_cores" "dry run does not rewrite config"
 assert_grep "$WORK/run.log" "Planning Complete" "planning completes"
+
+# =============================================================================
+scenario "a typo'd VMID aborts the run before ANY host or VM mutation"
+cat > "$WORK/config.json" <<'EOF'
+{
+  "global_settings": { "reserve_host_cores": true, "host_cores": [0, 8] },
+  "vms": { "101": 2, "999": 2 }
+}
+EOF
+export QM_FIXTURE_DIR="$FIXTURES/qm-mem"
+export GRUB_FILE="$WORK/grub"
+export SYSTEMD_ETC="$WORK/sysd"
+printf 'GRUB_CMDLINE_LINUX_DEFAULT="quiet"\n' > "$GRUB_FILE"
+run_manager -f "$WORK/config.json" -g
+
+assert_exit_code 1 "$RUN_RC" "exits 1"
+assert_grep "$WORK/run.log" "VM\(s\) not found on this node: 999\. No changes were applied\." "missing VM reported"
+assert_file_absent "$WORK/sysd" "no systemd drop-ins written"
+assert_grep "$WORK/grub" '^GRUB_CMDLINE_LINUX_DEFAULT="quiet"$' "GRUB untouched"
+assert_not_grep "$WORK/qm-calls.log" "^qm set" "no VM was reconfigured"
+assert_not_grep "$WORK/systemctl-calls.log" "set-property" "no slice was touched"
+
+# =============================================================================
+scenario "invalid core counts and host_cores are rejected up front"
+cat > "$WORK/config.json" <<'EOF'
+{
+  "global_settings": { "reserve_host_cores": false },
+  "vms": { "101": 0 }
+}
+EOF
+run_manager -f "$WORK/config.json" -n -g
+assert_exit_code 1 "$RUN_RC" "core count 0 exits 1"
+assert_grep "$WORK/run.log" "VM 101: invalid core count '0'" "core count validated"
+
+cat > "$WORK/config.json" <<'EOF'
+{
+  "global_settings": { "reserve_host_cores": true, "host_cores": [0, 99] },
+  "vms": { "101": 2 }
+}
+EOF
+run_manager -f "$WORK/config.json" -n -g
+assert_exit_code 1 "$RUN_RC" "foreign host core exits 1"
+assert_grep "$WORK/run.log" "host_cores entry '99' is not a CPU on this host" "host_cores validated against topology"
+
+# =============================================================================
+scenario "concurrent runs are blocked by the lock"
+write_basic_config
+export LOCK_FILE="$WORK/lock"
+exec 8>"$LOCK_FILE"
+flock -n 8
+run_manager -f "$WORK/config.json" -n -g
+exec 8>&-
+
+assert_exit_code 1 "$RUN_RC" "second instance exits 1"
+assert_grep "$WORK/run.log" "Another instance is already running" "lock contention reported"
+
+# =============================================================================
+scenario "pending changes on running VMs are surfaced with a restart hint"
+mkdir -p "$WORK/qm"
+cp "$FIXTURES/qm-mem/"*.conf "$WORK/qm/"
+echo "status: running" > "$WORK/qm/104.status"
+printf 'cur cores 2\npending affinity 1,9\npending numa0 cpus=0-1,hostnodes=0,memory=2048,policy=bind\n' > "$WORK/qm/104.pending"
+cat > "$WORK/config.json" <<EOF
+{
+  "global_settings": { "reserve_host_cores": true, "host_cores": [0, 8], "state_file": "$WORK/state.json" },
+  "disk_settings": { "storage_node_map": { "local-lvm": "node:0" } },
+  "vms": { "101": 2, "102": 2, "103": 2, "104": 2 }
+}
+EOF
+export QM_FIXTURE_DIR="$WORK/qm"
+export GRUB_FILE="$WORK/grub"
+export SYSTEMD_ETC="$WORK/sysd"
+printf 'GRUB_CMDLINE_LINUX_DEFAULT="quiet"\n' > "$GRUB_FILE"
+make_node_hugepages 0 8
+make_node_hugepages 1 8
+run_manager -f "$WORK/config.json" -g
+
+assert_exit_code 0 "$RUN_RC" "apply exits 0"
+assert_grep "$WORK/run.log" "VM 104 is running: 2 change\(s\) are PENDING" "per-VM pending warning"
+assert_grep "$WORK/run.log" "PENDING CHANGES: VM\(s\) 104 are running and must be power-cycled" "end-of-run restart summary"
+
+# =============================================================================
+scenario "planner warns when 1G hugepages are planned but not free or not configured"
+write_basic_config
+export QM_FIXTURE_DIR="$FIXTURES/qm-mem"
+# Node 0 has 8 pages allocated but only 1 actually free.
+make_node_hugepages 0 8 1
+make_node_hugepages 1 8 8
+run_manager -f "$WORK/config.json" -n -g
+assert_exit_code 0 "$RUN_RC" "plan still succeeds"
+assert_grep "$WORK/run.log" "Node 0: plan needs 6x1G hugepages but only 1 are free" "free-pool shortfall warned"
+
+# Same plan against a host with no 1G hugepage pool at all (sysfs absent).
+export NODE_SYS_BASE="$WORK/empty-node-tree"
+mkdir -p "$NODE_SYS_BASE"
+run_manager -f "$WORK/config.json" -n -g
+assert_exit_code 0 "$RUN_RC" "plan still succeeds without a hugepage pool"
+assert_grep "$WORK/run.log" "1G hugepages planned, but this node exposes no 1G hugepage pool" "missing hugepage pool warned"
 
 # =============================================================================
 echo ""
