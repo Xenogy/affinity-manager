@@ -75,9 +75,32 @@ scenario() {
     export QM_CALL_LOG="$WORK/qm-calls.log"
     export SYSTEMCTL_CALL_LOG="$WORK/systemctl-calls.log"
     export IRQ_PROC_BASE="$WORK/fake-irq"
-    unset LSPCI_FIXTURE NVIDIA_SMI_MEM_MB PCI_SYS_BASE NODE_SYS_BASE GRUB_FILE SYSTEMD_ETC LOCK_FILE \
+    unset LSPCI_FIXTURE NVIDIA_SMI_MEM_MB QM_FAIL_SET_VMIDS SYSTEMCTL_IS_ENABLED_RC \
         QEMU_PID_DIR PROC_BASE TASKSET_CALL_LOG 2>/dev/null || true
     mkdir -p "$IRQ_PROC_BASE"
+    # Hermetic-by-default host touchpoints: every override the manager honors
+    # points at a fresh fake under $WORK, so nothing a scenario does (or
+    # forgets to do) can read or touch the real host. Previously several of
+    # these were merely unset and fell back to the real paths -- scenarios
+    # that relied on "no mdev support" or "no hugepage pool" passed in CI
+    # containers but failed on actual vGPU hosts, every scenario flocked the
+    # REAL /run/lock/affinity-manager.lock (colliding with production runs),
+    # and dry-run logs quoted the real /etc/default/grub.
+    export PCI_SYS_BASE="$WORK/fake-pci"          # make_gpu populates
+    export NODE_SYS_BASE="$WORK/fake-node"        # make_node_hugepages populates
+    mkdir -p "$PCI_SYS_BASE" "$NODE_SYS_BASE"
+    export LOCK_FILE="$WORK/lock"
+    export GRUB_FILE="$WORK/fake-grub"
+    printf 'GRUB_CMDLINE_LINUX_DEFAULT="quiet"\n' > "$GRUB_FILE"
+    export SYSTEMD_ETC="$WORK/fake-systemd-etc"
+    export PROC_SYS_BASE="$WORK/fake-procsys"
+    export SYSCTL_D="$WORK/fake-sysctld"
+    export KSM_RUN_FILE="$WORK/fake-ksm-run"
+    export CPUFREQ_BASE="$WORK/fake-cpufreq"
+    export PROC_CMDLINE_FILE="$WORK/fake-cmdline"
+    printf 'BOOT_IMAGE=/boot/vmlinuz quiet\n' > "$PROC_CMDLINE_FILE"
+    # Keep the hookscript's append-log off unless a scenario opts in.
+    export VCPU_PIN_LOG=""
 }
 
 # make_gpu <pci> <numa-node> <profile> <available-instances>: fake PCI sysfs
@@ -168,6 +191,9 @@ assert_file_exists "$STATE_FILE_PATH" "dry-run state file written to .dryrun"
 assert_file_absent "$WORK/manager_state.json" "real state file untouched by dry run"
 assert_json "$STATE_FILE_PATH" '.core_assignments | length == 4' "state file covers all 4 VMs"
 assert_json "$STATE_FILE_PATH" '.core_assignments["101"].numa_node == 1' "state file records VM 101 on node 1"
+assert_json "$STATE_FILE_PATH" '.metadata.applied == false' "dry-run state is marked applied=false"
+# Post-run checks run in dry-run mode too, and say why GRUB is not in sync.
+assert_grep "$WORK/run.log" "does not contain the planned isolation params \(dry run did not write them\)" "dry run explains unwritten GRUB params"
 
 # =============================================================================
 scenario "gpu-mode dry-run degrades to cpu-only when GPU has no mdev support"
@@ -248,6 +274,57 @@ assert_grep "$WORK/qm-calls.log" "^qm set 104 -net0 virtio=AA:BB:CC:DD:EE:04,bri
 assert_grep "$WORK/qm-calls.log" "^qm set 104 -scsi0 local-lvm:vm-104-disk-0,size=32G,iothread=1$" "iothread enabled on boot disk"
 assert_file_exists "$WORK/state.json" "state written to configured state_file path"
 assert_json "$WORK/state.json" '.core_assignments | length == 4' "state covers all VMs"
+assert_json "$WORK/state.json" '.metadata.applied == true' "state is marked applied after a successful apply"
+# Post-run checks: GRUB was just updated but the (fake) booted cmdline has no
+# isolation params; the IRQ unit is not enabled; no VM has a hookscript.
+assert_grep "$WORK/run.log" "POST-RUN CHECKS" "post-run summary printed"
+assert_grep "$WORK/run.log" "REBOOT REQUIRED: the booted kernel does not match the GRUB isolation params" "reboot requirement flagged"
+assert_grep "$WORK/run.log" "affinity-manager-irq.service is NOT enabled" "missing IRQ boot unit flagged"
+assert_grep "$WORK/run.log" "4 VM\(s\) have NO hookscript attached: 101 102 103 104" "missing hookscripts flagged with VMIDs"
+
+# =============================================================================
+scenario "post-run checks pass when GRUB matches boot, IRQ unit enabled, hook attached"
+write_basic_config
+# host_cores [0,8] on the intel-2s topology -> VM cores 1-7,9-15.
+printf 'GRUB_CMDLINE_LINUX_DEFAULT="quiet isolcpus=managed_irq,domain,1-7,9-15 nohz_full=1-7,9-15 rcu_nocbs=1-7,9-15"\n' > "$GRUB_FILE"
+printf 'BOOT_IMAGE=/boot/vmlinuz quiet isolcpus=managed_irq,domain,1-7,9-15 nohz_full=1-7,9-15 rcu_nocbs=1-7,9-15\n' > "$PROC_CMDLINE_FILE"
+export SYSTEMCTL_IS_ENABLED_RC=0
+run_manager -f "$WORK/config.json" -n -g -s "local:snippets/vcpu-pin-hook.sh"
+
+assert_exit_code 0 "$RUN_RC" "exits 0"
+assert_grep "$WORK/run.log" "GRUB: isolation params match the booted kernel -- no reboot needed" "no-reboot case detected"
+assert_grep "$WORK/run.log" "affinity-manager-irq.service is enabled" "enabled IRQ unit detected"
+assert_grep "$WORK/run.log" "would be attached to all 4 VM\(s\)" "hookscript coverage via -s acknowledged"
+assert_grep "$WORK/run.log" "All post-run checks passed" "green summary verdict"
+
+# Same, but the hookscript is already present in each VM's config (no -s).
+mkdir -p "$WORK/qm-hooked"
+for v in 101 102 103 104; do
+    cp "$FIXTURES/qm-basic/$v.conf" "$WORK/qm-hooked/$v.conf"
+    echo "hookscript: local:snippets/vcpu-pin-hook.sh" >> "$WORK/qm-hooked/$v.conf"
+done
+export QM_FIXTURE_DIR="$WORK/qm-hooked"
+run_manager -f "$WORK/config.json" -n -g
+assert_grep "$WORK/run.log" "all 4 VM\(s\) have a hookscript attached" "hookscript detected from VM configs"
+
+# =============================================================================
+scenario "a failed qm set leaves the state file marked applied=false"
+cat > "$WORK/config.json" <<EOF
+{
+  "global_settings": { "reserve_host_cores": true, "host_cores": [0, 8], "state_file": "$WORK/state.json" },
+  "disk_settings": { "storage_node_map": { "local-lvm": "node:0" } },
+  "vms": { "101": 2, "102": 2 }
+}
+EOF
+export QM_FIXTURE_DIR="$FIXTURES/qm-mem"
+export QM_FAIL_SET_VMIDS="102"
+run_manager -f "$WORK/config.json" -g
+
+assert_exit_code 1 "$RUN_RC" "apply exits non-zero"
+assert_grep "$WORK/run.log" "Configuration failed for VM\(s\): 102" "failed VM reported"
+assert_file_exists "$WORK/state.json" "state file records the attempted plan"
+assert_json "$WORK/state.json" '.metadata.applied == false' "state stays applied=false after a failed apply"
+assert_json "$WORK/state.json" '.core_assignments | length == 2' "attempted plan covers both VMs"
 
 # =============================================================================
 scenario "apply preserves single-quoted GRUB_CMDLINE_LINUX_DEFAULT"
@@ -486,7 +563,7 @@ assert_file_absent "$WORK/sysd" "no systemd drop-ins written"
 assert_grep "$WORK/grub" '^GRUB_CMDLINE_LINUX_DEFAULT="quiet"$' "GRUB untouched"
 
 # =============================================================================
-scenario "hookscript pins vCPU threads 1:1 from the VM's affinity"
+scenario "hookscript pins vCPUs 1:1 and spreads helper threads in reverse"
 mkdir -p "$WORK/qm"
 cp "$FIXTURES/qm-mem/101.conf" "$WORK/qm/101.conf"
 echo "affinity: 1,9" >> "$WORK/qm/101.conf"
@@ -494,19 +571,27 @@ export QM_FIXTURE_DIR="$WORK/qm"
 export QEMU_PID_DIR="$WORK/pid-dir"
 export PROC_BASE="$WORK/fake-proc"
 export TASKSET_CALL_LOG="$WORK/taskset.log"
-mkdir -p "$WORK/pid-dir" "$WORK/fake-proc/4242/task/5001" "$WORK/fake-proc/4242/task/5002" "$WORK/fake-proc/4242/task/5003"
+export VCPU_PIN_LOG="$WORK/cpu-pin.log"
+mkdir -p "$WORK/pid-dir" "$WORK/fake-proc/4242/task/5001" "$WORK/fake-proc/4242/task/5002" \
+    "$WORK/fake-proc/4242/task/5003" "$WORK/fake-proc/4242/task/5004"
 echo 4242 > "$WORK/pid-dir/101.pid"
 printf 'CPU 0/KVM\n' > "$WORK/fake-proc/4242/task/5001/comm"
 printf 'CPU 1/KVM\n' > "$WORK/fake-proc/4242/task/5002/comm"
-printf 'iou-wrk-iothread1\n' > "$WORK/fake-proc/4242/task/5003/comm"
+printf 'kvm\n' > "$WORK/fake-proc/4242/task/5003/comm"
+printf 'vhost-4242\n' > "$WORK/fake-proc/4242/task/5004/comm"
 
 HOOK_RC=0
 "$ROOT/extras/vcpu-pin-hook.sh" 101 post-start > "$WORK/hook.log" 2>&1 || HOOK_RC=$?
 assert_exit_code 0 "$HOOK_RC" "post-start hook exits 0"
 assert_grep "$WORK/taskset.log" "^taskset -pc 1 5001$" "vCPU 0 pinned to first affinity core"
 assert_grep "$WORK/taskset.log" "^taskset -pc 9 5002$" "vCPU 1 pinned to second affinity core"
-assert_not_grep "$WORK/taskset.log" "5003" "non-vCPU thread left on the shared mask"
-assert_grep "$WORK/hook.log" "pinned 2 vCPU thread\(s\) of VM 101" "hook reports its work"
+# Helpers are distributed over the affinity cores in REVERSE order (away from
+# vCPU 0's core first): main loop -> 9, vhost worker -> 1.
+assert_grep "$WORK/taskset.log" "^taskset -pc 9 5003$" "first helper lands on the last affinity core"
+assert_grep "$WORK/taskset.log" "^taskset -pc 1 5004$" "second helper round-robins to the next core"
+assert_grep "$WORK/hook.log" "pinned 2 vCPU thread\(s\) of VM 101" "hook reports vCPU pinning"
+assert_grep "$WORK/hook.log" "distributed 2 helper thread\(s\) of VM 101 over: 9,1" "hook reports helper spread"
+assert_grep "$WORK/cpu-pin.log" "vCPU 0 \(tid 5001\) -> CPU 1" "append-log written when VCPU_PIN_LOG is set"
 
 # Other phases are no-ops.
 : > "$WORK/taskset.log"

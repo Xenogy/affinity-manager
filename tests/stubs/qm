@@ -43,6 +43,14 @@ case "$cmd" in
         ;;
     set)
         vm_exists || exit 2
+        # Failure injection: QM_FAIL_SET_VMIDS lists VMIDs whose `qm set`
+        # exits 1 (space-separated), for testing the failed-apply path.
+        for fail_vmid in ${QM_FAIL_SET_VMIDS:-}; do
+            if [[ "$fail_vmid" == "$vmid" ]]; then
+                echo "stub: injected qm set failure for VM $vmid" >&2
+                exit 1
+            fi
+        done
         exit 0
         ;;
     *)
