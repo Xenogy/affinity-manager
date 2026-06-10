@@ -27,12 +27,83 @@ usage() {
 # (planning) is a greedy, order-dependent algorithm and stays sequential.
 # =============================================================================
 
-# Block until fewer than PARALLEL_JOBS background jobs are running. Job failures
-# are reported via result/marker files, so swallow wait -n's exit status here.
+# --- Live progress for parallel phases ---
+# Per-job output is captured and replayed after the join (for deterministic log
+# order), which would otherwise leave the console silent while slow tasks run --
+# looking like a hang. So the PARENT prints progress as it reaps each job:
+#   <label>: dispatching N task(s) ...     (phase start)
+#     [k/N] <label>: <item> done           (per completed job)
+#   <label>: all N task(s) completed in Ts (phase end)
+# On bash >= 5.1, `wait -n -p` reports WHICH child finished so the line can name
+# the VM/GPU; older bash falls back to anonymous "[k/N] task done" counters.
+# Job failures are still reported via result/marker files, never via wait status.
+_PAR_LABEL=""
+_PAR_TOTAL=0
+_PAR_DONE=0
+_PAR_T0=0
+declare -A _PAR_JOB_NAME
+_PAR_HAVE_WAITP=0
+if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then
+    _PAR_HAVE_WAITP=1
+fi
+
+# parallel_begin <label> <total>: announce the fan-out and reset progress state.
+parallel_begin() {
+    _PAR_LABEL=$1
+    _PAR_TOTAL=$2
+    _PAR_DONE=0
+    _PAR_T0=$SECONDS
+    _PAR_JOB_NAME=()
+    if (( _PAR_TOTAL > 0 )); then
+        log "  ${_PAR_LABEL}: dispatching ${_PAR_TOTAL} task(s) async (up to ${PARALLEL_JOBS} concurrent); detailed logs follow once all finish..."
+    fi
+}
+
+# parallel_track <item-name> <pid>: remember which item a background job handles.
+parallel_track() { _PAR_JOB_NAME["$2"]=$1; }
+
+# Reap exactly one finished background job and print a [k/N] progress line.
+# Returns 1 when there are no children left to reap.
+parallel_reap_one() {
+    local pid="" name=""
+    if (( _PAR_HAVE_WAITP )); then
+        wait -n -p pid 2>/dev/null || true
+        [[ -n "$pid" ]] || return 1
+        name=${_PAR_JOB_NAME[$pid]:-}
+        unset "_PAR_JOB_NAME[$pid]"
+    else
+        local rc=0
+        wait -n 2>/dev/null || rc=$?
+        # 127 = no remaining children (indistinguishable from a job exiting 127,
+        # but failures are tracked via marker files, so this is cosmetic-safe).
+        (( rc == 127 )) && return 1
+    fi
+    _PAR_DONE=$(( _PAR_DONE + 1 ))
+    if [[ -n "$name" ]]; then
+        log "    [${_PAR_DONE}/${_PAR_TOTAL}] ${_PAR_LABEL}: ${name} done"
+    else
+        log "    [${_PAR_DONE}/${_PAR_TOTAL}] ${_PAR_LABEL}: task done"
+    fi
+    return 0
+}
+
+# Block until fewer than PARALLEL_JOBS background jobs are running, reporting
+# progress for every job reaped along the way.
 parallel_throttle() {
     while (( $(jobs -rp | wc -l) >= PARALLEL_JOBS )); do
-        wait -n 2>/dev/null || true
+        parallel_reap_one || break
     done
+}
+
+# Join all remaining jobs of the current phase, with progress, then summarize.
+parallel_drain() {
+    while (( _PAR_DONE < _PAR_TOTAL )); do
+        parallel_reap_one || break
+    done
+    wait
+    if (( _PAR_TOTAL > 0 )); then
+        log "  ${_PAR_LABEL}: all ${_PAR_DONE}/${_PAR_TOTAL} task(s) completed in $(( SECONDS - _PAR_T0 ))s."
+    fi
 }
 
 # Replay a captured job's combined output, routing [WARN]-prefixed lines back to
@@ -1124,17 +1195,25 @@ discover_gpus() {
         fi
     fi
 
-    # Probe every GPU in parallel: each is an independent sysfs + nvidia-smi read.
-    local _gtmp; _gtmp=$(mktemp -d)
+    # Parse candidate PCI slots up front so the progress total is exact.
+    local -a gpu_slots=()
     local line pci_slot
     while read -r line; do
         [[ -n "$line" ]] || continue
         pci_slot=$(echo "$line" | cut -d ' ' -f 1)
         [[ -n "$pci_slot" ]] || continue
+        gpu_slots+=("$pci_slot")
+    done < <(echo "$lspci_input")
+
+    # Probe every GPU in parallel: each is an independent sysfs + nvidia-smi read.
+    local _gtmp; _gtmp=$(mktemp -d)
+    parallel_begin "GPU probing" "${#gpu_slots[@]}"
+    for pci_slot in "${gpu_slots[@]}"; do
         parallel_throttle
         { discover_one_gpu "$pci_slot" "$_gtmp/${pci_slot}.dat" "$target_vram" "$auto_detect" "$manual_mdev" > "$_gtmp/${pci_slot}.log" 2>&1; } &
-    done < <(echo "$lspci_input")
-    wait
+        parallel_track "GPU $pci_slot" $!
+    done
+    parallel_drain
 
     # Replay captured logs, then fold the results back into the global arrays in a
     # stable (PCI-sorted) order so planning is deterministic regardless of timing.
@@ -1200,6 +1279,7 @@ done
 # latency-bound (qm/pvesm/lsblk/lvs/vgs) and fully independent across VMs. Each
 # job writes "mem_mb|pages|mem_ok|disk_node|disk_source" to a temp file.
 _p2_tmp=$(mktemp -d)
+parallel_begin "Disk/memory detection" "${#VMS_TO_CONFIGURE[@]}"
 for vmid in "${!VMS_TO_CONFIGURE[@]}"; do
     parallel_throttle
     {
@@ -1222,8 +1302,9 @@ for vmid in "${!VMS_TO_CONFIGURE[@]}"; do
 
         printf '%s|%s|%s|%s|%s\n' "$vm_mem_mb" "$vm_pages_1g" "$mem_ok" "$disk_node" "$disk_source" > "$_p2_tmp/$vmid"
     } &
+    parallel_track "VM $vmid" $!
 done
-wait
+parallel_drain
 
 # Collect results back into the global arrays in sorted order (logs stay readable
 # and ordered exactly as in the sequential version).
@@ -1811,11 +1892,13 @@ execute_one_vm() {
 # therefore means that VM failed. One bad VM no longer stops the others, but the
 # run still aborts non-zero at the end if any VM failed.
 _p4_tmp=$(mktemp -d)
+parallel_begin "VM configuration" "${#VMS_TO_CONFIGURE[@]}"
 for vmid in "${!VMS_TO_CONFIGURE[@]}"; do
     parallel_throttle
     { execute_one_vm "$vmid" > "$_p4_tmp/${vmid}.log" 2>&1; touch "$_p4_tmp/${vmid}.ok"; } &
+    parallel_track "VM $vmid" $!
 done
-wait
+parallel_drain
 
 _p4_failed=()
 for vmid in $(printf '%s\n' "${!VMS_TO_CONFIGURE[@]}" | sort -n); do
