@@ -168,9 +168,10 @@ sudo ./manager.sh -f config.json --install-hook local:snippets/cpu-pin.sh    # c
 ```
 
 The target path is resolved from the volume ID via `pvesm path`; an existing file
-with different content is backed up to `<name>.bak` before being replaced, and the
-post-run checks warn whenever an attached hook's content drifts from the bundled
-`extras/` copy. Manual install works too:
+with different content is backed up to a timestamped `<name>.bak.<ts>` before being
+replaced (atomically), and the post-run checks warn whenever an attached hook's
+content drifts from the bundled `extras/` copy — or points at a file that no longer
+exists. Manual install works too:
 
 ```bash
 cp extras/vcpu-pin-hook.sh /var/lib/vz/snippets/
