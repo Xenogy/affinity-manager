@@ -141,14 +141,15 @@ create_state_file() {
     local state_file="$STATE_FILE"
     local timestamp=$(date -Iseconds)
 
-    log "Creating state file: $state_file"
+    log "Creating state file: $state_file (applied=$STATE_APPLIED)"
     cat > "$state_file" << STATEEOF
 {
   "metadata": {
     "timestamp": "$timestamp",
-        "version": "11.5-disk-locality+irq-confine+parallel",
+        "version": "11.6-disk-locality+irq-confine+parallel",
     "config_file": "$CONFIG_FILE",
-    "dry_run": $([ $DRY_RUN -eq 1 ] && echo "true" || echo "false")
+    "dry_run": $([ $DRY_RUN -eq 1 ] && echo "true" || echo "false"),
+    "applied": $STATE_APPLIED
   },
   "core_assignments": {
 STATEEOF
@@ -560,6 +561,12 @@ fi
 if [[ $DRY_RUN -eq 1 ]]; then
     STATE_FILE="${STATE_FILE}.dryrun"
 fi
+
+# The state file is first written when planning completes (so a failed apply
+# still leaves a record of what was attempted) and rewritten with applied=true
+# only after Phase 4 succeeds. applied=false therefore means "planned, but not
+# (fully) on the host".
+STATE_APPLIED="false"
 
 
 # =============================================================================
@@ -2281,6 +2288,13 @@ rm -rf "$_p4_tmp"
 
 if (( ${#_p4_failed[@]} > 0 )); then
     error "Configuration failed for VM(s): ${_p4_failed[*]}"
+fi
+
+# Every VM applied cleanly -- rewrite the state file marked as applied, so the
+# file can be trusted as a record of what is actually configured on the host.
+if [[ $DRY_RUN -eq 0 ]]; then
+    STATE_APPLIED="true"
+    create_state_file
 fi
 
 if (( ${#_p4_restart[@]} > 0 )); then

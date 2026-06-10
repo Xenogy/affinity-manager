@@ -75,9 +75,20 @@ scenario() {
     export QM_CALL_LOG="$WORK/qm-calls.log"
     export SYSTEMCTL_CALL_LOG="$WORK/systemctl-calls.log"
     export IRQ_PROC_BASE="$WORK/fake-irq"
-    unset LSPCI_FIXTURE NVIDIA_SMI_MEM_MB PCI_SYS_BASE NODE_SYS_BASE GRUB_FILE SYSTEMD_ETC LOCK_FILE \
+    unset LSPCI_FIXTURE NVIDIA_SMI_MEM_MB GRUB_FILE SYSTEMD_ETC LOCK_FILE \
         QEMU_PID_DIR PROC_BASE TASKSET_CALL_LOG 2>/dev/null || true
     mkdir -p "$IRQ_PROC_BASE"
+    # Hermetic-by-default /sys trees: EMPTY fakes, so a real host's GPUs or
+    # hugepage pools can never leak into a scenario. (Previously these were
+    # merely unset and fell back to the real /sys -- scenarios that relied on
+    # "no mdev support" or "no hugepage pool" passed in CI containers but
+    # failed on actual vGPU hosts.) make_gpu / make_node_hugepages populate
+    # these same paths.
+    export PCI_SYS_BASE="$WORK/fake-pci"
+    export NODE_SYS_BASE="$WORK/fake-node"
+    mkdir -p "$PCI_SYS_BASE" "$NODE_SYS_BASE"
+    # Keep the hookscript's append-log off unless a scenario opts in.
+    export VCPU_PIN_LOG=""
 }
 
 # make_gpu <pci> <numa-node> <profile> <available-instances>: fake PCI sysfs
@@ -168,6 +179,7 @@ assert_file_exists "$STATE_FILE_PATH" "dry-run state file written to .dryrun"
 assert_file_absent "$WORK/manager_state.json" "real state file untouched by dry run"
 assert_json "$STATE_FILE_PATH" '.core_assignments | length == 4' "state file covers all 4 VMs"
 assert_json "$STATE_FILE_PATH" '.core_assignments["101"].numa_node == 1' "state file records VM 101 on node 1"
+assert_json "$STATE_FILE_PATH" '.metadata.applied == false' "dry-run state is marked applied=false"
 
 # =============================================================================
 scenario "gpu-mode dry-run degrades to cpu-only when GPU has no mdev support"
@@ -248,6 +260,7 @@ assert_grep "$WORK/qm-calls.log" "^qm set 104 -net0 virtio=AA:BB:CC:DD:EE:04,bri
 assert_grep "$WORK/qm-calls.log" "^qm set 104 -scsi0 local-lvm:vm-104-disk-0,size=32G,iothread=1$" "iothread enabled on boot disk"
 assert_file_exists "$WORK/state.json" "state written to configured state_file path"
 assert_json "$WORK/state.json" '.core_assignments | length == 4' "state covers all VMs"
+assert_json "$WORK/state.json" '.metadata.applied == true' "state is marked applied after a successful apply"
 
 # =============================================================================
 scenario "apply preserves single-quoted GRUB_CMDLINE_LINUX_DEFAULT"
@@ -486,7 +499,7 @@ assert_file_absent "$WORK/sysd" "no systemd drop-ins written"
 assert_grep "$WORK/grub" '^GRUB_CMDLINE_LINUX_DEFAULT="quiet"$' "GRUB untouched"
 
 # =============================================================================
-scenario "hookscript pins vCPU threads 1:1 from the VM's affinity"
+scenario "hookscript pins vCPUs 1:1 and spreads helper threads in reverse"
 mkdir -p "$WORK/qm"
 cp "$FIXTURES/qm-mem/101.conf" "$WORK/qm/101.conf"
 echo "affinity: 1,9" >> "$WORK/qm/101.conf"
@@ -494,19 +507,27 @@ export QM_FIXTURE_DIR="$WORK/qm"
 export QEMU_PID_DIR="$WORK/pid-dir"
 export PROC_BASE="$WORK/fake-proc"
 export TASKSET_CALL_LOG="$WORK/taskset.log"
-mkdir -p "$WORK/pid-dir" "$WORK/fake-proc/4242/task/5001" "$WORK/fake-proc/4242/task/5002" "$WORK/fake-proc/4242/task/5003"
+export VCPU_PIN_LOG="$WORK/cpu-pin.log"
+mkdir -p "$WORK/pid-dir" "$WORK/fake-proc/4242/task/5001" "$WORK/fake-proc/4242/task/5002" \
+    "$WORK/fake-proc/4242/task/5003" "$WORK/fake-proc/4242/task/5004"
 echo 4242 > "$WORK/pid-dir/101.pid"
 printf 'CPU 0/KVM\n' > "$WORK/fake-proc/4242/task/5001/comm"
 printf 'CPU 1/KVM\n' > "$WORK/fake-proc/4242/task/5002/comm"
-printf 'iou-wrk-iothread1\n' > "$WORK/fake-proc/4242/task/5003/comm"
+printf 'kvm\n' > "$WORK/fake-proc/4242/task/5003/comm"
+printf 'vhost-4242\n' > "$WORK/fake-proc/4242/task/5004/comm"
 
 HOOK_RC=0
 "$ROOT/extras/vcpu-pin-hook.sh" 101 post-start > "$WORK/hook.log" 2>&1 || HOOK_RC=$?
 assert_exit_code 0 "$HOOK_RC" "post-start hook exits 0"
 assert_grep "$WORK/taskset.log" "^taskset -pc 1 5001$" "vCPU 0 pinned to first affinity core"
 assert_grep "$WORK/taskset.log" "^taskset -pc 9 5002$" "vCPU 1 pinned to second affinity core"
-assert_not_grep "$WORK/taskset.log" "5003" "non-vCPU thread left on the shared mask"
-assert_grep "$WORK/hook.log" "pinned 2 vCPU thread\(s\) of VM 101" "hook reports its work"
+# Helpers are distributed over the affinity cores in REVERSE order (away from
+# vCPU 0's core first): main loop -> 9, vhost worker -> 1.
+assert_grep "$WORK/taskset.log" "^taskset -pc 9 5003$" "first helper lands on the last affinity core"
+assert_grep "$WORK/taskset.log" "^taskset -pc 1 5004$" "second helper round-robins to the next core"
+assert_grep "$WORK/hook.log" "pinned 2 vCPU thread\(s\) of VM 101" "hook reports vCPU pinning"
+assert_grep "$WORK/hook.log" "distributed 2 helper thread\(s\) of VM 101 over: 9,1" "hook reports helper spread"
+assert_grep "$WORK/cpu-pin.log" "vCPU 0 \(tid 5001\) -> CPU 1" "append-log written when VCPU_PIN_LOG is set"
 
 # Other phases are no-ops.
 : > "$WORK/taskset.log"

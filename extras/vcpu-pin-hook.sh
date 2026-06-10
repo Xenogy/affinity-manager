@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
 # Proxmox VM hookscript: pin each vCPU thread 1:1 to the cores of the VM's
-# affinity mask.
+# affinity mask, and spread the VM's helper threads across the same cores.
 #
 # `qm set -affinity` constrains ALL of the VM's threads (vCPUs, the QEMU main
-# loop, iothreads) to one shared mask: vCPUs migrate within it and compete
-# with each other and with the emulator for the same cores. This hook adds
-# libvirt-style vcpupin on top at every VM start: vCPU k -> the k-th CPU of
-# the affinity list (the order manager.sh planned: physical cores first, then
-# their SMT siblings). Non-vCPU threads keep the full shared mask.
+# loop, iothreads, vhost workers) to one shared mask. On a host with
+# isolcpus=domain that is not enough: the scheduler does no load balancing
+# inside the mask, so (a) vCPUs migrate or stack arbitrarily and (b) every
+# helper thread stays on whichever CPU it was forked on -- typically the same
+# core as vCPU 0, where it then competes with the guest. At every VM start
+# this hook therefore applies:
+#   - libvirt-style vcpupin: vCPU k -> the k-th CPU of the affinity list
+#     (the order manager.sh planned: physical cores first, then their SMT
+#     siblings);
+#   - helper distribution: every other thread of the QEMU process (main loop,
+#     iothreads, vhost-net workers, KVM housekeeping) is pinned round-robin
+#     over the affinity cores in REVERSE order, so helpers land on the SMT
+#     half first and on vCPU 0's core last.
 #
 # Install (requires a storage with the 'snippets' content type):
 #   cp extras/vcpu-pin-hook.sh /var/lib/vz/snippets/
@@ -25,9 +33,16 @@ PHASE="${2:-}"
 # Test hooks (defaults are the real locations).
 QEMU_PID_DIR="${QEMU_PID_DIR:-/var/run/qemu-server}"
 PROC_BASE="${PROC_BASE:-/proc}"
+# Best-effort append-only log file, in addition to stdout (which Proxmox
+# captures in the VM start task log). Set empty to disable.
+VCPU_PIN_LOG="${VCPU_PIN_LOG-/var/log/cpu-pin.log}"
 
-log()  { echo "[vcpu-pin-hook] $*"; }
-warn() { echo "[vcpu-pin-hook] WARNING: $*" >&2; }
+_logfile() {
+    [[ -n "$VCPU_PIN_LOG" ]] || return 0
+    echo "$(date '+%F %T') [vm $VMID] $*" >> "$VCPU_PIN_LOG" 2>/dev/null || true
+}
+log()  { echo "[vcpu-pin-hook] $*"; _logfile "$*"; }
+warn() { echo "[vcpu-pin-hook] WARNING: $*" >&2; _logfile "WARNING: $*"; }
 
 [[ "$PHASE" == "post-start" ]] || exit 0
 [[ -n "$VMID" ]] || exit 0
@@ -96,4 +111,32 @@ if (( pinned == 0 )); then
 else
     log "pinned $pinned vCPU thread(s) of VM $VMID 1:1 onto: $affinity"
 fi
+
+# --- Helper threads: QEMU main loop, iothreads, vhost workers, etc. ---
+# (On kernel >= 6.4 vhost workers are user-worker tasks and appear under the
+# QEMU process's task dir, so one scan covers them too.) Reverse round-robin
+# so the first helpers land farthest from vCPU 0's core.
+rev_cores=()
+for (( i=${#cores[@]}-1; i>=0; i-- )); do rev_cores+=("${cores[i]}"); done
+helpers=0
+helpers_failed=0
+for task_dir in "$PROC_BASE/$pid/task"/*; do
+    [[ -r "$task_dir/comm" ]] || continue
+    comm=$(<"$task_dir/comm")
+    [[ "$comm" =~ ^CPU\ [0-9]+/KVM$ ]] && continue
+    tid=${task_dir##*/}
+    target=${rev_cores[$(( helpers % ${#rev_cores[@]} ))]}
+    if taskset -pc "$target" "$tid" > /dev/null 2>&1; then
+        log "VM $VMID helper '$comm' (tid $tid) -> CPU $target"
+        helpers=$((helpers + 1))
+    else
+        # Transient threads (io_uring / thread-pool workers) can exit between
+        # the readdir and the taskset, or reject affinity changes; not fatal.
+        helpers_failed=$((helpers_failed + 1))
+    fi
+done
+if (( helpers_failed > 0 )); then
+    warn "could not pin $helpers_failed helper thread(s) of VM $VMID (transient or affinity-restricted)."
+fi
+log "distributed $helpers helper thread(s) of VM $VMID over: $(IFS=,; echo "${rev_cores[*]}")"
 exit 0

@@ -88,7 +88,9 @@ layout takes effect.
   Entries are validated against the actual topology.
 - `state_file` — where the plan record is written (default `manager_state.json`).
   Dry runs write to `<state_file>.dryrun` so a preview never overwrites the record
-  of the last real apply.
+  of the last real apply. The file carries `metadata.applied`: written `false` when
+  planning completes, rewritten `true` only after every VM applied cleanly — so
+  `applied: false` in a non-dryrun state file means the apply phase did not finish.
 - `parallel_jobs` — max concurrent jobs for GPU probing, disk detection, and VM
   config. Optional; defaults to the host CPU count (`nproc`). Set to `1` to force
   fully sequential execution.
@@ -128,12 +130,21 @@ block mapping a VM or storage to a node, e.g.
   cores (run `update-grub` and reboot to activate).
 - Movable device IRQs that overlap VM cores are steered onto the host cores.
 
-### Per-vCPU 1:1 pinning (extras/vcpu-pin-hook.sh)
+### Per-vCPU 1:1 pinning + helper spread (extras/vcpu-pin-hook.sh)
 
-`qm`'s affinity is one shared mask for every thread of the VM — vCPUs migrate within
-it and compete with the QEMU main loop and iothreads. The bundled hookscript adds
-libvirt-style vcpupin at every VM start: vCPU *k* is pinned to the *k*-th CPU of the
-affinity list, while the emulator/iothreads keep the shared mask.
+`qm`'s affinity is one shared mask for every thread of the VM — and on a host with
+`isolcpus=domain` the scheduler does no load balancing *inside* that mask, so the
+QEMU main loop, iothreads and vhost-net workers all stack on whichever CPU they were
+forked on (typically vCPU 0's core, where they then compete with the guest). The
+bundled hookscript fixes both at every VM start:
+
+- libvirt-style vcpupin: vCPU *k* is pinned to the *k*-th CPU of the affinity list;
+- every other thread of the QEMU process (main loop, iothreads, vhost workers, KVM
+  housekeeping) is pinned round-robin over the affinity cores in **reverse** order,
+  so helpers land away from vCPU 0's core first instead of stacking on it.
+
+Besides stdout (captured in the Proxmox VM-start task log) the hook appends to
+`/var/log/cpu-pin.log`; set `VCPU_PIN_LOG=` (empty) to disable that.
 
 ```bash
 cp extras/vcpu-pin-hook.sh /var/lib/vz/snippets/
