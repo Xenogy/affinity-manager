@@ -160,6 +160,19 @@ Besides stdout (captured in the Proxmox VM-start task log) the hook appends to
 `/var/log/cpu-pin.log`; set `VCPU_PIN_LOG=` (empty) to disable that — and give it
 a logrotate entry if your VMs restart frequently.
 
+One flag installs (or refreshes) the snippet and attaches it to every managed VM:
+
+```bash
+sudo ./manager.sh -f config.json --install-hook                              # default: local:snippets/vcpu-pin-hook.sh
+sudo ./manager.sh -f config.json --install-hook local:snippets/cpu-pin.sh    # custom volume ID
+```
+
+The target path is resolved from the volume ID via `pvesm path`; an existing file
+with different content is backed up to a timestamped `<name>.bak.<ts>` before being
+replaced (atomically), and the post-run checks warn whenever an attached hook's
+content drifts from the bundled `extras/` copy — or points at a file that no longer
+exists. Manual install works too:
+
 ```bash
 cp extras/vcpu-pin-hook.sh /var/lib/vz/snippets/
 chmod +x /var/lib/vz/snippets/vcpu-pin-hook.sh
@@ -170,14 +183,17 @@ sudo ./manager.sh -f config.json -s local:snippets/vcpu-pin-hook.sh
 
 `/proc/irq` affinity resets on every reboot (and on NIC driver re-init). The systemd
 drop-ins and GRUB params persist, the IRQ placement does not — re-apply it with
-`manager.sh -f config.json -i`, or install the bundled oneshot unit to do it at boot:
+`manager.sh -f config.json -i`, or install the oneshot unit that does it at boot:
 
 ```bash
-cp manager.sh /usr/local/sbin/affinity-manager.sh
-mkdir -p /etc/affinity-manager && cp config.json /etc/affinity-manager/
-cp extras/affinity-manager-irq.service /etc/systemd/system/
-systemctl daemon-reload && systemctl enable affinity-manager-irq.service
+sudo ./manager.sh -f config.json --install-irq-service
 ```
+
+This generates `/etc/systemd/system/affinity-manager-irq.service` with `ExecStart`
+pointing at the **absolute paths of this script and this config** (no hand-editing),
+reloads systemd, and enables it. Idempotent; re-run it after moving the repo or the
+config. The bundled `extras/affinity-manager-irq.service` remains as a template for
+manual installs (adapt the two `ExecStart` paths yourself).
 
 ## Examples
 
@@ -193,6 +209,9 @@ sudo ./manager.sh -f config.json -g
 
 # Re-apply IRQ confinement after a NIC reset
 sudo ./manager.sh -f config.json -i
+
+# First-time setup: pin everything AND install the hook + boot-time IRQ unit
+sudo ./manager.sh -f config.json --install-hook --install-irq-service
 ```
 
 ## Tests
