@@ -36,6 +36,13 @@ If any configured VM is running, its changes land as Proxmox *pending* changes; 
 script ends with an explicit list of VMs that must be power-cycled before the new
 layout takes effect.
 
+Every run (including dry runs) ends with **post-run checks** — the things one run
+cannot fully fix by itself: whether a **reboot** is required because the booted
+kernel does not match the GRUB isolation params (or GRUB still lacks the planned
+ones), whether `affinity-manager-irq.service` is enabled so IRQ confinement
+survives reboots, and whether every managed VM has a pinning **hookscript**
+attached. These are warnings only; they never change the exit code.
+
 ### Options
 
 | Flag | Description |

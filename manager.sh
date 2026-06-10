@@ -17,6 +17,7 @@ PROC_SYS_BASE="${PROC_SYS_BASE:-/proc/sys}"
 SYSCTL_D="${SYSCTL_D:-/etc/sysctl.d}"
 KSM_RUN_FILE="${KSM_RUN_FILE:-/sys/kernel/mm/ksm/run}"
 CPUFREQ_BASE="${CPUFREQ_BASE:-/sys/devices/system/cpu}"
+PROC_CMDLINE_FILE="${PROC_CMDLINE_FILE:-/proc/cmdline}"
 
 usage() {
     echo "Usage: $0 -f <config.json> [-n][-s <hook_script_path>] [-r] [-a [N]]"
@@ -1504,7 +1505,7 @@ discover_gpus
 # =============================================================================
 log "--- PHASE 2: Reading VM Configurations ---"
 declare -A VMS_TO_CONFIGURE VM_DISK_NODE_PREFERENCE VM_DISK_NODE_SOURCE
-declare -A VM_MEMORY_MB VM_HUGEPAGE_1G_PAGES
+declare -A VM_MEMORY_MB VM_HUGEPAGE_1G_PAGES VM_HAS_HOOKSCRIPT
 declare -A NODE_1G_HUGEPAGES_TOTAL NODE_1G_HUGEPAGES_PLANNED NODE_1G_HUGEPAGES_FREE
 TOTAL_CORES_REQUESTED=0
 
@@ -1562,11 +1563,16 @@ for vmid in "${!VMS_TO_CONFIGURE[@]}"; do
     parallel_throttle
     {
         # Existence first: a typo'd VMID must abort the run before anything is
-        # mutated, not surface as a pile of qm errors at the very end.
+        # mutated, not surface as a pile of qm errors at the very end. One
+        # config snapshot serves the existence, memory and hookscript reads.
+        vm_cfg_snapshot=$(qm config "$vmid" 2>/dev/null || true)
         vm_exists=0
-        if qm config "$vmid" > /dev/null 2>&1; then vm_exists=1; fi
+        if [[ -n "$vm_cfg_snapshot" ]]; then vm_exists=1; fi
 
-        vm_mem_mb=$(qm config "$vmid" 2>/dev/null | awk '/^memory:/ {print $2; exit}')
+        vm_has_hook=0
+        if echo "$vm_cfg_snapshot" | grep -q '^hookscript:'; then vm_has_hook=1; fi
+
+        vm_mem_mb=$(echo "$vm_cfg_snapshot" | awk '/^memory:/ {print $2; exit}')
         if [[ "$vm_mem_mb" =~ ^[0-9]+$ ]] && (( vm_mem_mb > 0 )); then
             mem_ok=1
             vm_pages_1g=$(( (vm_mem_mb + 1023) / 1024 ))
@@ -1583,7 +1589,7 @@ for vmid in "${!VMS_TO_CONFIGURE[@]}"; do
             IFS='|' read -r disk_node disk_source <<< "$disk_pref_info"
         fi
 
-        printf '%s|%s|%s|%s|%s|%s\n' "$vm_exists" "$vm_mem_mb" "$vm_pages_1g" "$mem_ok" "$disk_node" "$disk_source" > "$_p2_tmp/$vmid"
+        printf '%s|%s|%s|%s|%s|%s|%s\n' "$vm_exists" "$vm_mem_mb" "$vm_pages_1g" "$mem_ok" "$vm_has_hook" "$disk_node" "$disk_source" > "$_p2_tmp/$vmid"
     } &
     parallel_track "VM $vmid" $!
 done
@@ -1595,9 +1601,9 @@ _missing_vms=()
 for vmid in $(printf '%s\n' "${!VMS_TO_CONFIGURE[@]}" | sort -n); do
     cores=${VMS_TO_CONFIGURE[$vmid]}
     if [[ -f "$_p2_tmp/$vmid" ]]; then
-        IFS='|' read -r vm_exists vm_mem_mb vm_pages_1g mem_ok disk_node disk_source < "$_p2_tmp/$vmid"
+        IFS='|' read -r vm_exists vm_mem_mb vm_pages_1g mem_ok vm_has_hook disk_node disk_source < "$_p2_tmp/$vmid"
     else
-        vm_exists=0; vm_mem_mb=0; vm_pages_1g=0; mem_ok=0; disk_node=""; disk_source=""
+        vm_exists=0; vm_mem_mb=0; vm_pages_1g=0; mem_ok=0; vm_has_hook=0; disk_node=""; disk_source=""
     fi
 
     if [[ "$vm_exists" != "1" ]]; then
@@ -1607,6 +1613,7 @@ for vmid in $(printf '%s\n' "${!VMS_TO_CONFIGURE[@]}" | sort -n); do
 
     VM_MEMORY_MB["$vmid"]=${vm_mem_mb:-0}
     VM_HUGEPAGE_1G_PAGES["$vmid"]=${vm_pages_1g:-0}
+    VM_HAS_HOOKSCRIPT["$vmid"]=${vm_has_hook:-0}
     if [[ "$mem_ok" != "1" ]]; then
         warn "  VM $vmid: could not read memory size for hugepage planning; hugepage guard skipped for this VM."
     fi
@@ -2148,6 +2155,93 @@ apply_host_pinning
 
 
 # =============================================================================
+# --- POST-RUN CHECKS ---
+# Summarized at the very end, so they are not buried in per-phase output:
+# the things a single run cannot fully fix by itself. Whether the host must
+# be REBOOTED for the GRUB isolation params, whether boot-time IRQ
+# re-confinement (affinity-manager-irq.service) is set up, and whether every
+# managed VM actually has a pinning hookscript attached. Informational only:
+# warnings here never change the exit code.
+# =============================================================================
+post_run_checks() {
+    log "--- POST-RUN CHECKS ---"
+    local issues=0
+
+    # 1) GRUB isolation params: planned vs file vs the BOOTED kernel.
+    #    (vm_cores_ranges is set by apply_host_pinning at Phase 3.5.)
+    if [[ "$RESERVE_HOST_CORES" == "true" && ${#CORES_TO_RESERVE[@]} -gt 0 && -n "${vm_cores_ranges:-}" ]]; then
+        local wanted_iso="isolcpus=managed_irq,domain,${vm_cores_ranges}"
+        local wanted_nohz="nohz_full=${vm_cores_ranges}"
+        local wanted_rcu="rcu_nocbs=${vm_cores_ranges}"
+        if [[ ! -f "$GRUB_FILE" ]]; then
+            warn "  GRUB: $GRUB_FILE not found -- cannot verify isolation params."
+            issues=1
+        else
+            local grub_line grub_iso grub_nohz grub_rcu booted booted_iso booted_nohz booted_rcu
+            grub_line=$(grep -m1 '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_FILE" || true)
+            grub_iso=$(echo "$grub_line" | grep -oP "isolcpus=[^\s\"']+" || true)
+            grub_nohz=$(echo "$grub_line" | grep -oP "nohz_full=[^\s\"']+" || true)
+            grub_rcu=$(echo "$grub_line" | grep -oP "rcu_nocbs=[^\s\"']+" || true)
+            booted=$(cat "$PROC_CMDLINE_FILE" 2>/dev/null || true)
+            booted_iso=$(echo "$booted" | grep -oP "isolcpus=[^\s\"']+" || true)
+            booted_nohz=$(echo "$booted" | grep -oP "nohz_full=[^\s\"']+" || true)
+            booted_rcu=$(echo "$booted" | grep -oP "rcu_nocbs=[^\s\"']+" || true)
+            if [[ "$grub_iso" != "$wanted_iso" || "$grub_nohz" != "$wanted_nohz" || "$grub_rcu" != "$wanted_rcu" ]]; then
+                warn "  GRUB: $GRUB_FILE does not contain the planned isolation params$([ $DRY_RUN -eq 1 ] && echo ' (dry run did not write them)')."
+                warn "    planned: $wanted_iso $wanted_nohz $wanted_rcu"
+                warn "    in file: ${grub_iso:-none} ${grub_nohz:-none} ${grub_rcu:-none}"
+                issues=1
+            elif [[ "$booted_iso" != "$grub_iso" || "$booted_nohz" != "$grub_nohz" || "$booted_rcu" != "$grub_rcu" ]]; then
+                warn "  REBOOT REQUIRED: the booted kernel does not match the GRUB isolation params."
+                warn "    booted:  ${booted_iso:-none} ${booted_nohz:-none} ${booted_rcu:-none}"
+                warn "    in GRUB: $grub_iso $grub_nohz $grub_rcu"
+                warn "    Run 'update-grub' and reboot to activate them."
+                issues=1
+            else
+                log "  GRUB: isolation params match the booted kernel -- no reboot needed."
+            fi
+        fi
+    fi
+
+    # 2) Boot-time IRQ re-confinement (/proc/irq does not survive reboots).
+    if [[ "$RESERVE_HOST_CORES" == "true" && ${#CORES_TO_RESERVE[@]} -gt 0 ]]; then
+        if systemctl is-enabled --quiet affinity-manager-irq.service 2>/dev/null; then
+            log "  IRQ persistence: affinity-manager-irq.service is enabled."
+        else
+            warn "  IRQ persistence: affinity-manager-irq.service is NOT enabled -- device IRQ confinement will be lost on reboot."
+            warn "    Install: cp extras/affinity-manager-irq.service /etc/systemd/system/ (adapt the ExecStart paths),"
+            warn "    then: systemctl daemon-reload && systemctl enable affinity-manager-irq.service"
+            issues=1
+        fi
+    fi
+
+    # 3) Hookscript coverage (per-vCPU 1:1 pinning + helper-thread spread).
+    local _vmid
+    local -a missing_hook=()
+    for _vmid in $(printf '%s\n' "${!VMS_TO_CONFIGURE[@]}" | sort -n); do
+        if [[ "${VM_HAS_HOOKSCRIPT[$_vmid]:-0}" != "1" ]]; then missing_hook+=("$_vmid"); fi
+    done
+    if [[ -n "$HOOK_SCRIPT_PATH" ]]; then
+        if [[ $DRY_RUN -eq 0 ]]; then
+            log "  Hookscript: attached to all ${#VMS_TO_CONFIGURE[@]} VM(s) this run (-s $HOOK_SCRIPT_PATH)."
+        else
+            log "  Hookscript: would be attached to all ${#VMS_TO_CONFIGURE[@]} VM(s) (-s $HOOK_SCRIPT_PATH)."
+        fi
+    elif (( ${#missing_hook[@]} > 0 )); then
+        warn "  Hookscript: ${#missing_hook[@]} VM(s) have NO hookscript attached: ${missing_hook[*]}"
+        warn "    Without it, vCPUs float inside the shared affinity mask and helper threads stack on one core."
+        warn "    Attach with: $0 -f $CONFIG_FILE -s <storage>:snippets/vcpu-pin-hook.sh"
+        issues=1
+    else
+        log "  Hookscript: all ${#VMS_TO_CONFIGURE[@]} VM(s) have a hookscript attached."
+    fi
+
+    if (( issues == 0 )); then
+        log "  All post-run checks passed."
+    fi
+}
+
+# =============================================================================
 # --- PHASE 4: EXECUTION ---
 # =============================================================================
 log "--- PHASE 4: Executing Configuration ---"
@@ -2300,5 +2394,7 @@ fi
 if (( ${#_p4_restart[@]} > 0 )); then
     warn "PENDING CHANGES: VM(s) ${_p4_restart[*]} are running and must be power-cycled (qm shutdown <id> && qm start <id>) before the new affinity/NUMA/GPU layout takes effect."
 fi
+
+post_run_checks
 
 log "Script finished."
