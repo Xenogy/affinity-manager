@@ -23,6 +23,8 @@ usage() {
     echo "  -a [N]:                Auto-select host cores, consolidated on least GPU-loaded NUMA node. Optional."
     echo "  -b [N]:                Auto-select host cores, balanced across physical sockets (N phys + N SMT per socket). Optional."
     echo "  -g:                    Skip GPU discovery and assignment (force CPU-only). Optional."
+    echo "  -i:                    Only re-apply device IRQ confinement, then exit. Optional."
+    echo "                         (For boot-time use: see extras/affinity-manager-irq.service.)"
     exit 1
 }
 
@@ -456,6 +458,7 @@ AUTO_HOST_CORES=0
 BALANCE_SOCKETS=0
 CORES_PER_NUMA=1
 SKIP_GPU=0
+CONFINE_IRQS_ONLY=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -473,6 +476,7 @@ while [[ $# -gt 0 ]]; do
             if [[ $# -gt 1 && "$2" =~ ^[0-9]+$ ]]; then CORES_PER_NUMA="$2"; shift 2; else shift; fi
             ;;
         -g|--no-gpu) SKIP_GPU=1; shift ;;
+        -i|--confine-irqs-only) CONFINE_IRQS_ONLY=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) error "Unknown option: $1" ;;
     esac
@@ -1014,9 +1018,21 @@ if [[ "$RESERVE_HOST_CORES" == "true" ]]; then
         done
     fi
 
-    if [[ ${#CORES_TO_RESERVE[@]} -gt 0 ]]; then
+    if [[ ${#CORES_TO_RESERVE[@]} -gt 0 && $CONFINE_IRQS_ONLY -eq 0 ]]; then
         log "Host core reservation: ${CORES_TO_RESERVE[*]} (host pinning is applied only after the VM plan validates)."
     fi
+fi
+
+# -i: re-apply IRQ confinement only (e.g. from the boot-time systemd unit --
+# /proc/irq affinity does not survive reboots) and skip the GPU/VM phases.
+if [[ $CONFINE_IRQS_ONLY -eq 1 ]]; then
+    log "--- IRQ confinement only (-i) ---"
+    if [[ "$RESERVE_HOST_CORES" != "true" || ${#CORES_TO_RESERVE[@]} -eq 0 ]]; then
+        error "-i requires reserve_host_cores=true and host_cores (or -a/-b) in the config."
+    fi
+    confine_device_irqs
+    log "Script finished."
+    exit 0
 fi
 
 # Apply host core pinning (systemd slices, GRUB params, IRQ confinement).

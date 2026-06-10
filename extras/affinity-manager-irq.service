@@ -1,0 +1,27 @@
+# Re-apply device IRQ confinement at boot.
+#
+# The systemd drop-ins and GRUB parameters that manager.sh writes persist
+# across reboots, but /proc/irq/*/smp_affinity_list does NOT: it resets on
+# every reboot (and on NIC driver re-initialization). This oneshot unit
+# restores the IRQ placement without re-running the full plan.
+#
+# Install:
+#   cp manager.sh /usr/local/sbin/affinity-manager.sh
+#   mkdir -p /etc/affinity-manager && cp config.json /etc/affinity-manager/
+#   cp extras/affinity-manager-irq.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable affinity-manager-irq.service
+# Adjust the two paths in ExecStart= if you keep them elsewhere.
+
+[Unit]
+Description=Affinity Manager: confine device IRQs to reserved host cores
+# Run late so NIC/NVMe drivers have registered their IRQs.
+After=network-online.target multi-user.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/affinity-manager.sh -f /etc/affinity-manager/config.json --confine-irqs-only
+
+[Install]
+WantedBy=multi-user.target

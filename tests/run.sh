@@ -75,7 +75,8 @@ scenario() {
     export QM_CALL_LOG="$WORK/qm-calls.log"
     export SYSTEMCTL_CALL_LOG="$WORK/systemctl-calls.log"
     export IRQ_PROC_BASE="$WORK/fake-irq"
-    unset LSPCI_FIXTURE NVIDIA_SMI_MEM_MB PCI_SYS_BASE NODE_SYS_BASE GRUB_FILE SYSTEMD_ETC LOCK_FILE 2>/dev/null || true
+    unset LSPCI_FIXTURE NVIDIA_SMI_MEM_MB PCI_SYS_BASE NODE_SYS_BASE GRUB_FILE SYSTEMD_ETC LOCK_FILE \
+        QEMU_PID_DIR PROC_BASE TASKSET_CALL_LOG 2>/dev/null || true
     mkdir -p "$IRQ_PROC_BASE"
 }
 
@@ -465,6 +466,63 @@ assert_grep "$WORK/run.log" "CPUs: 8 physical core\(s\), 8 SMT thread\(s\)" "8/8
 # VM 104 on node 0: physical cpu 2 plus its adjacent sibling cpu 3.
 assert_grep "$WORK/run.log" "\[DRY RUN\] Set Affinity: 2,3 \(Node 0\)" "interleaved sibling paired with its own core"
 assert_grep "$WORK/run.log" "\[DRY RUN\] Set Affinity: 8,9 \(Node 1\)" "overflow VM gets node-1 core pair"
+
+# =============================================================================
+scenario "-i re-applies IRQ confinement without touching VMs or slices"
+write_basic_config
+make_irq 40 eth1 "0-15"
+make_irq 41 nvme0q2 "0,8"
+export SYSTEMD_ETC="$WORK/sysd"
+export GRUB_FILE="$WORK/grub"
+printf 'GRUB_CMDLINE_LINUX_DEFAULT="quiet"\n' > "$GRUB_FILE"
+run_manager -f "$WORK/config.json" -i
+
+assert_exit_code 0 "$RUN_RC" "exits 0"
+assert_grep "$IRQ_PROC_BASE/40/smp_affinity_list" "^0,8$" "movable IRQ re-confined to host cores"
+assert_grep "$WORK/run.log" "IRQ confinement: 1 moved, 1 already on host cores" "confinement summary"
+assert_not_grep "$WORK/run.log" "PHASE 2" "VM phases skipped"
+assert_not_grep "$WORK/qm-calls.log" "^qm set" "no VM touched"
+assert_file_absent "$WORK/sysd" "no systemd drop-ins written"
+assert_grep "$WORK/grub" '^GRUB_CMDLINE_LINUX_DEFAULT="quiet"$' "GRUB untouched"
+
+# =============================================================================
+scenario "hookscript pins vCPU threads 1:1 from the VM's affinity"
+mkdir -p "$WORK/qm"
+cp "$FIXTURES/qm-mem/101.conf" "$WORK/qm/101.conf"
+echo "affinity: 1,9" >> "$WORK/qm/101.conf"
+export QM_FIXTURE_DIR="$WORK/qm"
+export QEMU_PID_DIR="$WORK/pid-dir"
+export PROC_BASE="$WORK/fake-proc"
+export TASKSET_CALL_LOG="$WORK/taskset.log"
+mkdir -p "$WORK/pid-dir" "$WORK/fake-proc/4242/task/5001" "$WORK/fake-proc/4242/task/5002" "$WORK/fake-proc/4242/task/5003"
+echo 4242 > "$WORK/pid-dir/101.pid"
+printf 'CPU 0/KVM\n' > "$WORK/fake-proc/4242/task/5001/comm"
+printf 'CPU 1/KVM\n' > "$WORK/fake-proc/4242/task/5002/comm"
+printf 'iou-wrk-iothread1\n' > "$WORK/fake-proc/4242/task/5003/comm"
+
+HOOK_RC=0
+"$ROOT/extras/vcpu-pin-hook.sh" 101 post-start > "$WORK/hook.log" 2>&1 || HOOK_RC=$?
+assert_exit_code 0 "$HOOK_RC" "post-start hook exits 0"
+assert_grep "$WORK/taskset.log" "^taskset -pc 1 5001$" "vCPU 0 pinned to first affinity core"
+assert_grep "$WORK/taskset.log" "^taskset -pc 9 5002$" "vCPU 1 pinned to second affinity core"
+assert_not_grep "$WORK/taskset.log" "5003" "non-vCPU thread left on the shared mask"
+assert_grep "$WORK/hook.log" "pinned 2 vCPU thread\(s\) of VM 101" "hook reports its work"
+
+# Other phases are no-ops.
+: > "$WORK/taskset.log"
+HOOK_RC=0
+"$ROOT/extras/vcpu-pin-hook.sh" 101 pre-start > "$WORK/hook.log" 2>&1 || HOOK_RC=$?
+assert_exit_code 0 "$HOOK_RC" "pre-start hook exits 0"
+assert_not_grep "$WORK/taskset.log" "taskset" "pre-start pins nothing"
+
+# A VM without affinity is skipped gracefully.
+mkdir -p "$WORK/qm2"
+cp "$FIXTURES/qm-mem/102.conf" "$WORK/qm2/102.conf"
+export QM_FIXTURE_DIR="$WORK/qm2"
+HOOK_RC=0
+"$ROOT/extras/vcpu-pin-hook.sh" 102 post-start > "$WORK/hook.log" 2>&1 || HOOK_RC=$?
+assert_exit_code 0 "$HOOK_RC" "hook exits 0 without affinity"
+assert_grep "$WORK/hook.log" "VM 102 has no affinity set" "explains the skip"
 
 # =============================================================================
 echo ""
