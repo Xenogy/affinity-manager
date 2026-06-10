@@ -1,0 +1,6 @@
+# Runtime state written by manager.sh (create_state_file) into the CWD
+manager_state.json
+
+# Timestamped config backups and the temp file the script makes on -a/-b
+*.backup.*
+*.tmp
