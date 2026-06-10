@@ -6,6 +6,11 @@ load-balanced layout — placing each VM on the NUMA node where its disk lives w
 can — reserves cores for the host, and applies everything with `qm`. It can also run
 CPU-only.
 
+The independent, latency-bound work — GPU/mdev probing, per-VM disk-locality
+detection, and applying each VM's `qm` config — runs in parallel across a bounded job
+pool, so runtime scales with the slowest VM rather than the sum of all of them. The
+NUMA-aware planning step stays sequential (each placement depends on the previous one).
+
 ## Requirements
 
 `qm`, `jq`, `lscpu`, `lspci`, and `bc` on the host — a standard Proxmox node with the
@@ -64,6 +69,9 @@ sudo ./manager.sh -f config.json
 - `cpu_config_string` — CPU type and flags passed to the VMs.
 - `reserve_host_cores` — keep `host_cores` for the host and pin VMs off them.
 - `host_cores` — CPU IDs reserved for the host (or leave it and use `-a`/`-b`).
+- `parallel_jobs` — max concurrent jobs for GPU probing, disk detection, and VM
+  config. Optional; defaults to the host CPU count (`nproc`). Set to `1` to force
+  fully sequential execution.
 
 **gpu_settings**
 - `required_vram_mb` — VRAM per vGPU slot.

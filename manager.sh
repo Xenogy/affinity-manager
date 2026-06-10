@@ -19,6 +19,36 @@ usage() {
 }
 
 # =============================================================================
+# --- PARALLELISM HELPERS ---
+# Independent per-item work (GPU probing, disk detection, applying VM configs)
+# is fanned out across background jobs. A backgrounded function runs in its own
+# subshell, so it CANNOT mutate the parent's arrays -- each job writes its result
+# to a temp file and the parent reads them back serially after joining. Phase 3
+# (planning) is a greedy, order-dependent algorithm and stays sequential.
+# =============================================================================
+
+# Block until fewer than PARALLEL_JOBS background jobs are running. Job failures
+# are reported via result/marker files, so swallow wait -n's exit status here.
+parallel_throttle() {
+    while (( $(jobs -rp | wc -l) >= PARALLEL_JOBS )); do
+        wait -n 2>/dev/null || true
+    done
+}
+
+# Replay a captured job's combined output, routing [WARN]-prefixed lines back to
+# stderr so parallel work logs in the same stream order as the sequential path.
+replay_captured() {
+    local _line
+    while IFS= read -r _line; do
+        if [[ "$_line" == "[WARN]"* ]]; then
+            printf '%s\n' "$_line" >&2
+        else
+            printf '%s\n' "$_line"
+        fi
+    done < "$1"
+}
+
+# =============================================================================
 # --- STATE MANAGEMENT FUNCTIONS ---
 # =============================================================================
 
@@ -31,7 +61,7 @@ create_state_file() {
 {
   "metadata": {
     "timestamp": "$timestamp",
-        "version": "11.5-disk-locality+irq-confine",
+        "version": "11.5-disk-locality+irq-confine+parallel",
     "config_file": "$CONFIG_FILE",
     "dry_run": $([ $DRY_RUN -eq 1 ] && echo "true" || echo "false")
   },
@@ -397,6 +427,16 @@ if [[ $RESET_HOST_PINNING -eq 1 ]]; then
     log "Run the above commands manually as root to reset all pinning."
     exit 0
 fi
+
+# --- PARALLELISM CAP ---
+# Cap concurrent background jobs at global_settings.parallel_jobs, else the host
+# CPU count (nproc), floor 1. Set parallel_jobs=1 to force fully sequential work.
+PARALLEL_JOBS=$(jq -r '.global_settings.parallel_jobs // empty' "$CONFIG_FILE")
+if [[ ! "$PARALLEL_JOBS" =~ ^[0-9]+$ ]] || (( PARALLEL_JOBS < 1 )); then
+    PARALLEL_JOBS=$(nproc 2>/dev/null || echo 1)
+fi
+(( PARALLEL_JOBS >= 1 )) || PARALLEL_JOBS=1
+log "Parallelism: up to ${PARALLEL_JOBS} concurrent job(s) for discovery and execution."
 
 
 # =============================================================================
@@ -984,6 +1024,82 @@ if [[ $SKIP_GPU -eq 1 ]]; then
     log "  GPU assignment skipped (-g flag set)."
 fi
 
+# Probe one GPU (sysfs + nvidia-smi) and, on success, write a single
+# "pci|node|profile|slots|cap" line to $datfile. Designed to run as a background
+# job; emits its own log/warn lines (captured and replayed in order by the
+# parent) and touches no shared arrays.
+discover_one_gpu() {
+    local pci_slot=$1
+    local datfile=$2
+    local target_vram=$3
+    local auto_detect=$4
+    local manual_mdev=$5
+
+    local numa_path="/sys/bus/pci/devices/${pci_slot}/numa_node"
+    local numa_node="0"
+    if [[ -f "$numa_path" ]]; then
+        val=$(cat "$numa_path")
+        if [[ "$val" != "-1" ]]; then numa_node=$val; fi
+    fi
+
+    local mdev_base="/sys/bus/pci/devices/${pci_slot}/mdev_supported_types"
+    local selected_type=""
+    local available_instances=0
+
+    if [[ -d "$mdev_base" ]]; then
+        if [[ "$auto_detect" == "true" ]]; then
+            for type_dir in $(ls -1v "$mdev_base"); do
+                desc_file="${mdev_base}/${type_dir}/description"
+                if [[ -f "$desc_file" ]]; then
+                    if grep -q "framebuffer=${target_vram}M" "$desc_file"; then
+                        selected_type="$type_dir"
+                        available_instances=$(cat "${mdev_base}/${type_dir}/available_instances")
+                        break
+                    fi
+                fi
+            done
+        else
+            # Check for per-GPU profile mapping first
+            local gpu_specific_mdev=$(jq -r --arg pci "$pci_slot" '.gpu_settings.gpu_profile_map[$pci] // empty' "$CONFIG_FILE")
+            if [[ -n "$gpu_specific_mdev" && -d "${mdev_base}/${gpu_specific_mdev}" ]]; then
+                selected_type="$gpu_specific_mdev"
+                available_instances=$(cat "${mdev_base}/${gpu_specific_mdev}/available_instances")
+                log "    Using per-GPU profile mapping: $gpu_specific_mdev"
+            elif [[ -d "${mdev_base}/${manual_mdev}" ]]; then
+                selected_type="$manual_mdev"
+                available_instances=$(cat "${mdev_base}/${manual_mdev}/available_instances")
+            fi
+        fi
+    else
+        log "  GPU $pci_slot: No MDEV support found."
+        return 0
+    fi
+
+    if [[ -n "$selected_type" && $available_instances -gt 0 ]]; then
+        local vram_slot_cap=0
+        if command -v nvidia-smi &> /dev/null; then
+            local total_mem_mb=$(nvidia-smi --id="$pci_slot" --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null || echo "0")
+            if [[ "$total_mem_mb" -gt 0 ]]; then
+                local calculated_slots=$(( total_mem_mb / target_vram ))
+                vram_slot_cap=$calculated_slots
+                if (( calculated_slots < available_instances )); then
+                    log "  [Override] GPU $pci_slot: Sysfs reports $available_instances slots, but VRAM ($total_mem_mb MB) limits to $calculated_slots."
+                    available_instances=$calculated_slots
+                fi
+            fi
+        fi
+
+        if (( available_instances > 0 )); then
+            local slot_cap=$available_instances
+            if (( vram_slot_cap > 0 )); then slot_cap=$vram_slot_cap; fi
+            printf '%s|%s|%s|%s|%s\n' "$pci_slot" "$numa_node" "$selected_type" "$available_instances" "$slot_cap" > "$datfile"
+            log "  Registered GPU $pci_slot: Profile $selected_type | Slots Available: $available_instances | Node: $numa_node"
+        else
+            warn "  GPU $pci_slot ignored: $selected_type valid, but 0 slots available after VRAM check."
+        fi
+    fi
+}
+
 discover_gpus() {
     if [[ $SKIP_GPU -eq 1 ]]; then return; fi
     local target_vram=$(jq -r '.gpu_settings.required_vram_mb // 2048' "$CONFIG_FILE")
@@ -1008,80 +1124,35 @@ discover_gpus() {
         fi
     fi
 
+    # Probe every GPU in parallel: each is an independent sysfs + nvidia-smi read.
+    local _gtmp; _gtmp=$(mktemp -d)
+    local line pci_slot
     while read -r line; do
+        [[ -n "$line" ]] || continue
         pci_slot=$(echo "$line" | cut -d ' ' -f 1)
-        
-        local numa_path="/sys/bus/pci/devices/${pci_slot}/numa_node"
-        local numa_node="0"
-        if [[ -f "$numa_path" ]]; then
-            val=$(cat "$numa_path")
-            if [[ "$val" != "-1" ]]; then numa_node=$val; fi
-        fi
-
-        local mdev_base="/sys/bus/pci/devices/${pci_slot}/mdev_supported_types"
-        local selected_type=""
-        local available_instances=0
-        
-        if [[ -d "$mdev_base" ]]; then
-            if [[ "$auto_detect" == "true" ]]; then
-                for type_dir in $(ls -1v "$mdev_base"); do
-                    desc_file="${mdev_base}/${type_dir}/description"
-                    if [[ -f "$desc_file" ]]; then
-                        if grep -q "framebuffer=${target_vram}M" "$desc_file"; then
-                            selected_type="$type_dir"
-                            available_instances=$(cat "${mdev_base}/${type_dir}/available_instances")
-                            break
-                        fi
-                    fi
-                done
-            else
-                # Check for per-GPU profile mapping first
-                local gpu_specific_mdev=$(jq -r --arg pci "$pci_slot" '.gpu_settings.gpu_profile_map[$pci] // empty' "$CONFIG_FILE")
-                if [[ -n "$gpu_specific_mdev" && -d "${mdev_base}/${gpu_specific_mdev}" ]]; then
-                    selected_type="$gpu_specific_mdev"
-                    available_instances=$(cat "${mdev_base}/${gpu_specific_mdev}/available_instances")
-                    log "    Using per-GPU profile mapping: $gpu_specific_mdev"
-                elif [[ -d "${mdev_base}/${manual_mdev}" ]]; then
-                    selected_type="$manual_mdev"
-                    available_instances=$(cat "${mdev_base}/${manual_mdev}/available_instances")
-                fi
-            fi
-        else
-            log "  GPU $pci_slot: No MDEV support found."
-            continue
-        fi
-
-        if [[ -n "$selected_type" && $available_instances -gt 0 ]]; then
-            local vram_slot_cap=0
-            if command -v nvidia-smi &> /dev/null; then
-                local total_mem_mb=$(nvidia-smi --id="$pci_slot" --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null || echo "0")
-                if [[ "$total_mem_mb" -gt 0 ]]; then
-                    local calculated_slots=$(( total_mem_mb / target_vram ))
-                    vram_slot_cap=$calculated_slots
-                    if (( calculated_slots < available_instances )); then
-                        log "  [Override] GPU $pci_slot: Sysfs reports $available_instances slots, but VRAM ($total_mem_mb MB) limits to $calculated_slots."
-                        available_instances=$calculated_slots
-                    fi
-                fi
-            fi
-
-            if (( available_instances > 0 )); then
-                GPU_PCI_IDS+=("$pci_slot")
-                GPU_MAP["$pci_slot"]=$numa_node
-                GPU_MDEV_PROFILE["$pci_slot"]=$selected_type
-                GPU_SLOTS_FREE["$pci_slot"]=$available_instances
-                if (( vram_slot_cap > 0 )); then
-                    GPU_SLOTS_CAP["$pci_slot"]=$vram_slot_cap
-                else
-                    GPU_SLOTS_CAP["$pci_slot"]=$available_instances
-                fi
-                log "  Registered GPU $pci_slot: Profile $selected_type | Slots Available: $available_instances | Node: $numa_node"
-            else
-                warn "  GPU $pci_slot ignored: $selected_type valid, but 0 slots available after VRAM check."
-            fi
-        fi
-
+        [[ -n "$pci_slot" ]] || continue
+        parallel_throttle
+        { discover_one_gpu "$pci_slot" "$_gtmp/${pci_slot}.dat" "$target_vram" "$auto_detect" "$manual_mdev" > "$_gtmp/${pci_slot}.log" 2>&1; } &
     done < <(echo "$lspci_input")
+    wait
+
+    # Replay captured logs, then fold the results back into the global arrays in a
+    # stable (PCI-sorted) order so planning is deterministic regardless of timing.
+    local f
+    for f in $(find "$_gtmp" -name '*.log' 2>/dev/null | sort); do
+        replay_captured "$f"
+    done
+    for f in $(find "$_gtmp" -name '*.dat' 2>/dev/null | sort); do
+        local pci numa_node selected_type available_instances slot_cap
+        IFS='|' read -r pci numa_node selected_type available_instances slot_cap < "$f"
+        [[ -n "$pci" ]] || continue
+        GPU_PCI_IDS+=("$pci")
+        GPU_MAP["$pci"]=$numa_node
+        GPU_MDEV_PROFILE["$pci"]=$selected_type
+        GPU_SLOTS_FREE["$pci"]=$available_instances
+        GPU_SLOTS_CAP["$pci"]=$slot_cap
+    done
+    rm -rf "$_gtmp"
 }
 
 discover_gpus
@@ -1117,25 +1188,60 @@ for node_id in "${NUMA_NODE_IDS[@]}"; do
     fi
 done
 
+# Cheap serial pass: VM core counts and the running total come straight from the
+# config (jq), no per-VM subprocess latency, and the total must accumulate in order.
 for vmid in $(jq -r '.vms | keys[]' "$CONFIG_FILE"); do
     cores=$(jq -r --arg vmid "$vmid" '.vms[$vmid]' "$CONFIG_FILE")
     VMS_TO_CONFIGURE["$vmid"]="$cores"
     TOTAL_CORES_REQUESTED=$((TOTAL_CORES_REQUESTED + cores))
+done
 
-    vm_mem_mb=$(qm config "$vmid" 2>/dev/null | awk '/^memory:/ {print $2; exit}')
-    if [[ "$vm_mem_mb" =~ ^[0-9]+$ ]] && (( vm_mem_mb > 0 )); then
-        vm_pages_1g=$(( (vm_mem_mb + 1023) / 1024 ))
+# Parallel pass: per-VM memory read (qm config) and disk-locality detection are
+# latency-bound (qm/pvesm/lsblk/lvs/vgs) and fully independent across VMs. Each
+# job writes "mem_mb|pages|mem_ok|disk_node|disk_source" to a temp file.
+_p2_tmp=$(mktemp -d)
+for vmid in "${!VMS_TO_CONFIGURE[@]}"; do
+    parallel_throttle
+    {
+        vm_mem_mb=$(qm config "$vmid" 2>/dev/null | awk '/^memory:/ {print $2; exit}')
+        if [[ "$vm_mem_mb" =~ ^[0-9]+$ ]] && (( vm_mem_mb > 0 )); then
+            mem_ok=1
+            vm_pages_1g=$(( (vm_mem_mb + 1023) / 1024 ))
+        else
+            mem_ok=0
+            vm_mem_mb=0
+            vm_pages_1g=0
+        fi
+
+        disk_pref_info=$(detect_vm_disk_preference "$vmid" || true)
+        disk_node=""
+        disk_source=""
+        if [[ -n "$disk_pref_info" ]]; then
+            IFS='|' read -r disk_node disk_source <<< "$disk_pref_info"
+        fi
+
+        printf '%s|%s|%s|%s|%s\n' "$vm_mem_mb" "$vm_pages_1g" "$mem_ok" "$disk_node" "$disk_source" > "$_p2_tmp/$vmid"
+    } &
+done
+wait
+
+# Collect results back into the global arrays in sorted order (logs stay readable
+# and ordered exactly as in the sequential version).
+for vmid in $(printf '%s\n' "${!VMS_TO_CONFIGURE[@]}" | sort -n); do
+    cores=${VMS_TO_CONFIGURE[$vmid]}
+    if [[ -f "$_p2_tmp/$vmid" ]]; then
+        IFS='|' read -r vm_mem_mb vm_pages_1g mem_ok disk_node disk_source < "$_p2_tmp/$vmid"
     else
-        vm_mem_mb=0
-        vm_pages_1g=0
+        vm_mem_mb=0; vm_pages_1g=0; mem_ok=0; disk_node=""; disk_source=""
+    fi
+
+    VM_MEMORY_MB["$vmid"]=${vm_mem_mb:-0}
+    VM_HUGEPAGE_1G_PAGES["$vmid"]=${vm_pages_1g:-0}
+    if [[ "$mem_ok" != "1" ]]; then
         warn "  VM $vmid: could not read memory size for hugepage planning; hugepage guard skipped for this VM."
     fi
-    VM_MEMORY_MB["$vmid"]=$vm_mem_mb
-    VM_HUGEPAGE_1G_PAGES["$vmid"]=$vm_pages_1g
 
-    disk_pref_info=$(detect_vm_disk_preference "$vmid" || true)
-    if [[ -n "$disk_pref_info" ]]; then
-        IFS='|' read -r disk_node disk_source <<< "$disk_pref_info"
+    if [[ -n "$disk_node" ]]; then
         VM_DISK_NODE_PREFERENCE["$vmid"]="$disk_node"
         VM_DISK_NODE_SOURCE["$vmid"]="$disk_source"
         log "  VM $vmid: $cores cores$([ $SKIP_GPU -eq 1 ] && echo '' || echo ' [GPU TARGET]') [Disk prefers Node $disk_node via $disk_source]"
@@ -1143,6 +1249,7 @@ for vmid in $(jq -r '.vms | keys[]' "$CONFIG_FILE"); do
         log "  VM $vmid: $cores cores$([ $SKIP_GPU -eq 1 ] && echo '' || echo ' [GPU TARGET]') [Disk preference: none detected]"
     fi
 done
+rm -rf "$_p2_tmp"
 
 adjust_gpu_slots_for_running_vms() {
     if [[ $SKIP_GPU -eq 1 ]]; then return; fi
@@ -1630,11 +1737,17 @@ log "Planning Complete."
 log "--- PHASE 4: Executing Configuration ---"
 if [[ $DRY_RUN -eq 1 ]]; then warn "*** DRY RUN MODE ***"; fi
 
-for vmid in "${!VMS_TO_CONFIGURE[@]}"; do
+# Apply one VM's plan. Each VM is independent and qm takes a per-VM config lock,
+# so distinct VMIDs can be configured concurrently. Within a VM the qm calls stay
+# ordered (later reads depend on earlier writes). Designed to run as a background
+# job: logs are captured and replayed in VM order by the driver below.
+execute_one_vm() {
+    local vmid=$1
     log "--- Configuring VM $vmid ---"
-    plan=${VM_ASSIGNMENTS[$vmid]}
-    
+    local plan=${VM_ASSIGNMENTS[$vmid]}
+
     # [FIX] Updated sed delimiters to match new plan format '|'
+    local affinity node gpu_pci gpu_mdev cpu_count
     affinity=$(echo "$plan" | sed -n 's/.*cores=\([^|]*\).*/\1/p')
     node=$(echo "$plan" | sed -n 's/.*|node=\([^|]*\).*/\1/p')
     gpu_pci=$(echo "$plan" | sed -n 's/.*gpu_pci=\([^|]*\).*/\1/p')
@@ -1642,6 +1755,7 @@ for vmid in "${!VMS_TO_CONFIGURE[@]}"; do
     cpu_count=${VMS_TO_CONFIGURE[$vmid]}
 
     if [[ $DRY_RUN -eq 0 ]]; then
+        local vm_mem line iface boot_disk disk_line disk_opts disk_path
         qm set "$vmid" -cores "$cpu_count" -cpu "$CPU_CONFIG_STRING" -affinity "$affinity"
         vm_mem=$(qm config "$vmid" | grep '^memory:' | awk '{print $2}')
         qm set "$vmid" -numa 1 -numa0 "cpus=0-$((cpu_count-1)),hostnodes=$node,memory=$vm_mem,policy=bind" -hugepages 1024 -balloon 0
@@ -1658,7 +1772,7 @@ for vmid in "${!VMS_TO_CONFIGURE[@]}"; do
                 fi
             fi
         fi
-        
+
         while read -r line; do
              iface=$(echo "$line" | cut -d: -f1)
              qm set "$vmid" -"$iface" "$(echo "$line" | cut -d' ' -f2 | sed -E 's/,?queues=[0-9]+//g'),queues=$cpu_count"
@@ -1688,6 +1802,30 @@ for vmid in "${!VMS_TO_CONFIGURE[@]}"; do
             warn "  [DRY RUN] No GPU assigned (best-effort fallback)."
         fi
     fi
+}
+
+# Fan out VM configuration across the job pool. The function call is a standalone
+# simple command (NOT part of a && / || list) so set -e stays active inside it: a
+# failing qm step aborts that VM's remaining steps -- exactly as the sequential
+# script did -- which skips the trailing "touch .ok". Absence of the .ok marker
+# therefore means that VM failed. One bad VM no longer stops the others, but the
+# run still aborts non-zero at the end if any VM failed.
+_p4_tmp=$(mktemp -d)
+for vmid in "${!VMS_TO_CONFIGURE[@]}"; do
+    parallel_throttle
+    { execute_one_vm "$vmid" > "$_p4_tmp/${vmid}.log" 2>&1; touch "$_p4_tmp/${vmid}.ok"; } &
 done
+wait
+
+_p4_failed=()
+for vmid in $(printf '%s\n' "${!VMS_TO_CONFIGURE[@]}" | sort -n); do
+    [[ -f "$_p4_tmp/${vmid}.log" ]] && replay_captured "$_p4_tmp/${vmid}.log"
+    [[ -f "$_p4_tmp/${vmid}.ok" ]] || _p4_failed+=("$vmid")
+done
+rm -rf "$_p4_tmp"
+
+if (( ${#_p4_failed[@]} > 0 )); then
+    error "Configuration failed for VM(s): ${_p4_failed[*]}"
+fi
 
 log "Script finished."
