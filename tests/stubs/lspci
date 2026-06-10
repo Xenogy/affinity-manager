@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Test stub for lspci. Emits the fixture named by $LSPCI_FIXTURE, or nothing
+# when unset (a host with no PCI devices visible).
+set -euo pipefail
+if [[ -n "${LSPCI_FIXTURE:-}" && -f "${LSPCI_FIXTURE:-}" ]]; then
+    cat "$LSPCI_FIXTURE"
+fi

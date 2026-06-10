@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Test stub for nvidia-smi. Answers the one query manager.sh makes:
+#   nvidia-smi --id=<pci> --query-gpu=memory.total --format=csv,noheader,nounits
+# with $NVIDIA_SMI_MEM_MB (default 8192).
+set -euo pipefail
+echo "${NVIDIA_SMI_MEM_MB:-8192}"
