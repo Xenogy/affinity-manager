@@ -6,11 +6,6 @@ load-balanced layout — placing each VM on the NUMA node where its disk lives w
 can — reserves cores for the host, and applies everything with `qm`. It can also run
 CPU-only.
 
-The independent, latency-bound work — GPU/mdev probing, per-VM disk-locality
-detection, and applying each VM's `qm` config — runs in parallel across a bounded job
-pool, so runtime scales with the slowest VM rather than the sum of all of them. The
-NUMA-aware planning step stays sequential (each placement depends on the previous one).
-
 Everything is validated **before** anything is mutated: VM existence, core counts,
 host-core topology and plan feasibility are checked first, and host pinning (systemd
 slices, GRUB, IRQ confinement) is only applied once the whole plan is known good.
