@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Test stub for lvs. With LVS_FIXTURE_DIR set:
-#   lvs --noheadings -o vg_name <path>  -> cat "vg_name.<basename path>"
-#   lvs <vg>/<lv>                       -> exit 0 iff "exists.<vg>_<lv>" present
+#   lvs --noheadings -o vg_name <path>             -> cat "vg_name.<basename path>"
+#   lvs ... -o lv_size,data_percent <vg>/<pool>    -> cat "lv_size,data_percent.<pool>"
+#   lvs <vg>/<lv>                                  -> exit 0 iff "exists.<vg>_<lv>"
 # Otherwise fails, preserving the legacy "no LVM" behavior.
 set -euo pipefail
 [[ -n "${LVS_FIXTURE_DIR:-}" ]] || exit 1
@@ -9,7 +10,8 @@ field=""; pos=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -o) field="$2"; shift 2 ;;
-        --noheadings|-*) shift ;;
+        --units) shift 2 ;;   # value-taking (e.g. --units b)
+        --noheadings|--nosuffix|-*) shift ;;
         *) pos+=("$1"); shift ;;
     esac
 done
