@@ -1020,7 +1020,7 @@ apply_disk_throttle_to_vm() {
 # RETURN), even on fio failure. Returns non-zero on any setup failure.
 dt_calibrate_one_vg() {
     local vg="$1" sid="$2" jsonf="$3"
-    local size_g="${DT_CALIB_SIZE_G:-8}" rt="${DT_CALIB_RUNTIME:-15}"
+    local size_g="${DT_CALIB_SIZE_G:-4}" rt="${DT_CALIB_RUNTIME:-15}"
     local lvname="am-calib-$$" type thinpool dev io_json bw_json ir iw rd_bps wr_bps nice=""
     command -v ionice &> /dev/null && nice="ionice -c3"
 
@@ -1028,16 +1028,34 @@ dt_calibrate_one_vg() {
         warn "  Calib LV ${vg}/${lvname} already exists; skipping VG $vg."; return 1
     fi
     type=$(dt_storage_type "$sid" 2>/dev/null || echo "")
+    # --yes auto-confirms LVM's thin-pool over-provisioning prompt (creating an
+    # 8G scratch volume on an over-provisioned pool otherwise BLOCKS on a y/n
+    # read); </dev/null guarantees no lvcreate prompt can ever hang on the TTY.
     if [[ "$type" == "lvmthin" ]]; then
         thinpool=$(awk -v want="$sid" '/^[a-zA-Z]+:[ \t]/{inblk=($2==want)} inblk&&$1=="thinpool"{print $2;exit}' "$PVE_STORAGE_CFG")
         [[ -n "$thinpool" ]] || { warn "  VG $vg: no thinpool for storage $sid; skipping."; return 1; }
-        lvcreate -n "$lvname" -V "${size_g}G" --thinpool "$thinpool" "$vg" > /dev/null 2>&1 || { warn "  VG $vg: lvcreate (thin) failed."; return 1; }
+        # Refuse to calibrate if the thin pool lacks comfortable free DATA space:
+        # a scratch volume's writes allocate real pool blocks and could fill a
+        # near-full pool, stalling every VM on it. need ~= size * 1.1.
+        local pool_free_b need_b
+        pool_free_b=$(lvs --noheadings --units b --nosuffix -o lv_size,data_percent "${vg}/${thinpool}" 2>/dev/null \
+            | awk 'NF{ dp=($2==""?0:$2); printf "%.0f", $1*(100-dp)/100 }')
+        need_b=$(awk -v g="$size_g" 'BEGIN{ printf "%.0f", g*1073741824*1.1 }')
+        if [[ "$pool_free_b" =~ ^[0-9]+$ ]] && (( pool_free_b < need_b )); then
+            warn "  VG $vg: thin pool '$thinpool' has only ~$((pool_free_b/1073741824))GiB free data space (need ~$((need_b/1073741824))GiB); skipping to avoid filling it. Lower DT_CALIB_SIZE_G to override."
+            return 1
+        fi
+        lvcreate --yes -n "$lvname" -V "${size_g}G" --thinpool "$thinpool" "$vg" > /dev/null 2>&1 </dev/null || { warn "  VG $vg: lvcreate (thin) failed."; return 1; }
     else
-        lvcreate -n "$lvname" -L "${size_g}G" "$vg" > /dev/null 2>&1 || { warn "  VG $vg: lvcreate failed."; return 1; }
+        lvcreate --yes -n "$lvname" -L "${size_g}G" "$vg" > /dev/null 2>&1 </dev/null || { warn "  VG $vg: lvcreate failed."; return 1; }
     fi
     dev="/dev/${vg}/${lvname}"
+    # Track the live scratch LV so the signal trap in run_calibration_mode can
+    # remove it if the user Ctrl-C's mid-benchmark; the RETURN trap covers the
+    # normal/early exit paths below.
+    DT_ACTIVE_CALIB_LV="${vg}/${lvname}"
     # shellcheck disable=SC2064
-    trap "lvremove -f '${vg}/${lvname}' >/dev/null 2>&1 || true" RETURN
+    trap "lvremove -f '${vg}/${lvname}' >/dev/null 2>&1 || true; DT_ACTIVE_CALIB_LV=''" RETURN
 
     log "  Calibrating VG $vg on $dev (${size_g}G scratch, ${rt}s/job)..."
     io_json=$($nice fio --name=cal --filename="$dev" --direct=1 --ioengine=libaio \
@@ -1084,10 +1102,15 @@ run_calibration_mode() {
     (( ${#vg_storage[@]} > 0 )) || { log "No LVM VGs among managed VMs to calibrate."; return 0; }
     local jsonf; jsonf=$(mktemp)
     if [[ -f "$DT_CALIB_FILE" ]]; then cp "$DT_CALIB_FILE" "$jsonf"; else echo "{}" > "$jsonf"; fi
+    # If the user Ctrl-C's mid-benchmark, remove whatever scratch LV is live so
+    # it never leaks (the per-VG RETURN trap only covers normal returns).
+    DT_ACTIVE_CALIB_LV=""
+    trap 'if [[ -n "${DT_ACTIVE_CALIB_LV:-}" ]]; then lvremove -f "$DT_ACTIVE_CALIB_LV" >/dev/null 2>&1 || true; fi; warn "Calibration interrupted; scratch LV cleaned up."; exit 130' INT TERM
     for vg in "${!vg_storage[@]}"; do
         dt_calibrate_one_vg "$vg" "${vg_storage[$vg]}" "$jsonf" \
             || warn "  Calibration failed for VG $vg; its prior/heuristic capacity stands."
     done
+    trap - INT TERM
     # dt_calibrate_one_vg's RETURN trap persists into this scope (bash without
     # set -T); clear it so it does not re-fire on our return with a stale name.
     trap - RETURN

@@ -150,6 +150,13 @@ make_host_on_vg() {
     export LVS_FIXTURE_DIR="$WORK/fake-lvs"
 }
 
+# make_thinpool <pool> <size_bytes> <data_percent>: pool free-space fixture.
+make_thinpool() {
+    mkdir -p "$WORK/fake-lvs"
+    printf '  %s %s\n' "$2" "$3" > "$WORK/fake-lvs/lv_size,data_percent.$1"
+    export LVS_FIXTURE_DIR="$WORK/fake-lvs"
+}
+
 # make_gpu <pci> <numa-node> <profile> <available-instances>: fake PCI sysfs
 make_gpu() {
     local d="$WORK/fake-pci/$1"
@@ -941,6 +948,31 @@ run_manager -f "$WORK/config.json" -n -g
 assert_grep "$WORK/run.log" "Domain vg:pve .*source=calibration" "later run uses the calibrated capacity"
 # calibrated iops_wr 120000 * 0.75 / 4 = 22500
 assert_grep "$WORK/run.log" "\[DRY RUN\] Throttle scsi0:.*iops_wr=22500" "caps derived from measured capacity"
+
+# -----------------------------------------------------------------------------
+scenario "--calibrate auto-confirms lvcreate and never blocks on a TTY"
+make_storage_cfg
+make_vg_pvs pve /dev/nvme9n9
+export LVM_CALL_LOG="$WORK/lvm-calls.log"
+export FIO_IOPS_RD=240000 FIO_IOPS_WR=120000 FIO_BW_RD_BPS=2000000000 FIO_BW_WR_BPS=1000000000
+export DT_CALIB_RUNTIME=1 DT_CALIB_SIZE_G=1
+write_config_with_throttle '{ "101": 2 }' '{ "enabled": true }'
+run_manager -f "$WORK/config.json" --calibrate
+assert_exit_code 0 "$RUN_RC" "calibrate exits 0 (no interactive hang)"
+assert_grep "$WORK/lvm-calls.log" "lvcreate --yes .*--thinpool data pve" "lvcreate passes --yes to auto-confirm over-provisioning"
+
+# -----------------------------------------------------------------------------
+scenario "--calibrate skips a near-full thin pool instead of filling it"
+make_storage_cfg
+make_vg_pvs pve /dev/nvme9n9
+make_thinpool data 10737418240 98          # 10GiB pool, 98% used -> ~0.2GiB free
+export LVM_CALL_LOG="$WORK/lvm-calls.log"
+export DT_CALIB_RUNTIME=1 DT_CALIB_SIZE_G=4
+write_config_with_throttle '{ "101": 2 }' '{ "enabled": true }'
+run_manager -f "$WORK/config.json" --calibrate
+assert_exit_code 0 "$RUN_RC" "exits 0"
+assert_grep "$WORK/run.log" "free data space.*skipping to avoid filling it" "near-full pool is skipped"
+assert_not_grep "$WORK/lvm-calls.log" "lvcreate" "no scratch LV created on a near-full pool"
 
 # -----------------------------------------------------------------------------
 scenario "throttle disabled is a complete no-op"
