@@ -55,6 +55,7 @@ attached. These are warnings only; they never change the exit code.
 | `-i` | Only re-apply device IRQ confinement, then exit (see persistence below). |
 | `-s <volume-id>` | Attach a hook script to each VM (a snippets volume ID, e.g. `local:snippets/vcpu-pin-hook.sh`). |
 | `-r` | Print the commands to undo host core pinning. |
+| `--calibrate` | Measure each LVM VG's real bandwidth/IOPS with `fio` on a temporary LV, cache it, and exit. Opt-in; perturbs running VMs (see Disk I/O throttling). |
 | `-h` | Show usage and exit. |
 
 `-a` and `-b` write the cores they pick back into the config (a timestamped backup is made first).
@@ -121,6 +122,71 @@ attached. These are warnings only; they never change the exit code.
 Disk locality is detected automatically. To hint it, add an optional `disk_settings`
 block mapping a VM or storage to a node, e.g.
 `{ "disk_settings": { "vm_node_map": { "101": "node:0" } } }`.
+
+## Disk I/O throttling (optional)
+
+VMs that share one physical disk starve each other: one floods the queue and
+everyone else's `await` / weighted-I/O-time spikes. Enable `disk_throttle_settings`
+and the manager partitions each physical disk's capacity among the VMs that sit on
+it, enforced host-side by QEMU's per-disk throttle (`mbps_rd/wr`, `iops_rd/wr`). The
+limit is set with `qm set` as a **throttle-only** change to each disk line, so on a
+running VM QEMU hot-applies it (it does not go pending) and your other disk options
+(`size=`, `cache`, `iothread`, …) are preserved.
+
+**IOPS is the primary lever.** Since `await ≈ service_time / (1 − utilization)`, the
+contention that spikes weighted-I/O-time is small *random* I/O — bounded by
+operations/sec, not bytes/sec. MB/s caps stay on as a secondary guardrail. The real
+fix is the **headroom discipline**: every VM's budget on a disk sums to a fraction
+(default 75%) of the disk's true random-**write** capacity, so the queue never plans
+to 100%.
+
+The feature is **off by default** and starts as a planner — every run (including
+`-n`) prints a per-domain/per-disk table of what it *would* set; nothing is applied
+until `enabled: true` and a non-dry run.
+
+```json
+{
+  "disk_throttle_settings": {
+    "enabled": true,
+    "weighting": "cores",          // equal | cores | explicit (per-VM "weights")
+    "global_headroom_pct": 25,     // hold back 25% so utilization tops out ~0.75
+    "host_reserve": {              // when the host OS shares a VM's disk
+      "enabled": true,
+      "reserve_pct": 20,
+      "extra_paths": ["/var/lib/vz"]
+    },
+    "iops_enabled": true,          // the load-bearing lever
+    "mbps_enabled": true,          // secondary guardrail
+    "scope": "all_disks",          // or boot_disk_only
+    "floors": { "mbps_rd": 30, "mbps_wr": 30, "iops_rd": 50, "iops_wr": 50 },
+    "burst": { "enabled": false, "factor": 1.25, "length_seconds": 10 },
+    "unknown_class_default": "sata-ssd",
+    "unmanaged_derate": 1.0,
+    "weights": { "101": 3, "102": 1 },
+    "capacity_overrides": {
+      "vg:pve":  { "seq_rd_mbps": 3000, "seq_wr_mbps": 2000, "iops_rd": 400000, "iops_wr": 150000 }
+    }
+  }
+}
+```
+
+**How a disk's capacity is determined** (first that resolves wins):
+1. `capacity_overrides` keyed by `vg:<VG>` or device name — authoritative.
+2. `--calibrate` measurements (cached next to the state file).
+3. A conservative heuristic from the backing device class (`rotational` + transport).
+
+`sudo ./manager.sh -f config.json --calibrate` creates a small temporary LV on each
+managed VG, benchmarks it with `fio` (and **always** removes the LV afterward), and
+writes the numbers to the cache. It is opt-in and **perturbs running VMs** while it
+runs, so it never executes under `-n`.
+
+**Scope and limits.** Only **LVM / LVM-thin** disks are throttled; every other backend
+(ZFS, Ceph/RBD, NFS, directory, raw paths) is detected and **skipped with a warning**
+rather than throttled from a guessed capacity. The divisor counts *all* VMs on a disk
+(via `qm list`), not just configured ones, and warns about foreign VMs it cannot bound.
+Host-OS reserve is applied only when the host root resolves to an LVM VG a VM shares.
+Concurrent bursts can exceed device capacity, so `burst` defaults off. After applying,
+confirm the effect with `iostat -x` (lower `aqu-sz`/`await` on the shared disk).
 
 ## How VMs are kept on their cores
 
