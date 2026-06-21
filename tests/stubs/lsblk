@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-# Test stub for lsblk: empty output (success), matching a minimal CI image
-# where lsblk is absent, so device-class detection falls back to sysfs + the
-# device-name regex deterministically.
-set -euo pipefail
-exit 0
