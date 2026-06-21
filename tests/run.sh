@@ -78,7 +78,8 @@ scenario() {
     unset LSPCI_FIXTURE NVIDIA_SMI_MEM_MB QM_FAIL_SET_VMIDS SYSTEMCTL_IS_ENABLED_RC PVESM_PATH \
         QEMU_PID_DIR PROC_BASE TASKSET_CALL_LOG \
         VGS_FIXTURE_DIR LVS_FIXTURE_DIR DF_FIXTURE FIO_CALL_LOG LVM_CALL_LOG \
-        FIO_BW_RD_BPS FIO_BW_WR_BPS FIO_IOPS_RD FIO_IOPS_WR DT_CALIB_SIZE_G DT_CALIB_RUNTIME 2>/dev/null || true
+        FIO_BW_RD_BPS FIO_BW_WR_BPS FIO_IOPS_RD FIO_IOPS_WR DT_CALIB_SIZE_G DT_CALIB_RUNTIME \
+        DT_CALIB_NUMJOBS DT_CALIB_IOENGINE QM_RUNNING_VMIDS 2>/dev/null || true
     mkdir -p "$IRQ_PROC_BASE"
     # Hermetic-by-default host touchpoints: every override the manager honors
     # points at a fresh fake under $WORK, so nothing a scenario does (or
@@ -960,6 +961,22 @@ write_config_with_throttle '{ "101": 2 }' '{ "enabled": true }'
 run_manager -f "$WORK/config.json" --calibrate
 assert_exit_code 0 "$RUN_RC" "calibrate exits 0 (no interactive hang)"
 assert_grep "$WORK/lvm-calls.log" "lvcreate --yes .*--thinpool data pve" "lvcreate passes --yes to auto-confirm over-provisioning"
+
+# -----------------------------------------------------------------------------
+scenario "--calibrate preconditions, drives concurrency, and warns under load"
+make_storage_cfg
+make_vg_pvs pve /dev/nvme9n9
+export FIO_CALL_LOG="$WORK/fio-calls.log"
+export LVM_CALL_LOG="$WORK/lvm-calls.log"
+export FIO_IOPS_RD=240000 FIO_IOPS_WR=120000 FIO_BW_RD_BPS=2000000000 FIO_BW_WR_BPS=1000000000
+export DT_CALIB_RUNTIME=1 DT_CALIB_SIZE_G=1 DT_CALIB_IOENGINE=libaio
+export QM_RUNNING_VMIDS="101"
+write_config_with_throttle '{ "101": 2, "102": 2, "103": 2, "104": 2 }' '{ "enabled": true }'
+run_manager -f "$WORK/config.json" --calibrate
+assert_exit_code 0 "$RUN_RC" "calibrate exits 0"
+assert_grep "$WORK/fio-calls.log" "name=precond .*rw=write" "preconditioning write pass runs before measuring"
+assert_grep "$WORK/fio-calls.log" "rw=randrw .*--numjobs=4" "IOPS job drives concurrency (numjobs)"
+assert_grep "$WORK/run.log" "VM\(s\) are RUNNING.*calibrate during a quiet window" "warns that calibrating under load gives contended numbers"
 
 # -----------------------------------------------------------------------------
 scenario "--calibrate skips a near-full thin pool instead of filling it"

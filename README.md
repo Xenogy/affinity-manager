@@ -176,9 +176,20 @@ until `enabled: true` and a non-dry run.
 3. A conservative heuristic from the backing device class (`rotational` + transport).
 
 `sudo ./manager.sh -f config.json --calibrate` creates a small temporary LV on each
-managed VG, benchmarks it with `fio` (and **always** removes the LV afterward), and
-writes the numbers to the cache. It is opt-in and **perturbs running VMs** while it
-runs, so it never executes under `-n`.
+managed VG, preconditions it, benchmarks with `fio` (io_uring/libaio, `numjobs`
+concurrency, with a sequential precondition pass so thin first-write allocation does
+not understate bandwidth), and **always** removes the LV afterward. It is opt-in and
+**perturbs running VMs**, so it never runs under `-n`.
+
+> **Calibrate during a quiet window.** fio competing with live guests measures
+> *contended* capacity — lower and irreproducible — so caps come out too low and can
+> starve VMs. For accurate numbers, stop or idle the VMs first (the run warns when any
+> are running). Note that if host-core pinning is already applied, your shell — and
+> thus fio — is confined to the reserved host cores; `numjobs` keeps a few cores busy
+> enough to find the device ceiling, but a quiet, unpinned host is the gold standard.
+> When in doubt, skip calibration and set `capacity_overrides` to known specs.
+> Tunables (env): `DT_CALIB_NUMJOBS` (default 4), `DT_CALIB_IOENGINE` (`auto`),
+> `DT_CALIB_SIZE_G` (4), `DT_CALIB_RUNTIME` (15s/job).
 
 **Scope and limits.** Only **LVM / LVM-thin** disks are throttled; every other backend
 (ZFS, Ceph/RBD, NFS, directory, raw paths) is detected and **skipped with a warning**

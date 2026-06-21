@@ -43,12 +43,15 @@ case "$cmd" in
         ;;
     list)
         # Header + one row per <vmid>.conf in the fixture dir (numeric ids only).
+        # VMIDs listed in QM_RUNNING_VMIDS (space-separated) report "running".
         echo "      VMID NAME                 STATUS     MEM(MB)    BOOTDISK(GB) PID"
         for cf in "$dir"/*.conf; do
             [[ -e "$cf" ]] || continue
             id=$(basename "$cf" .conf)
             [[ "$id" =~ ^[0-9]+$ ]] || continue
-            printf '%10s %-20s %-10s %-10s %-12s %s\n' "$id" "vm-$id" "stopped" "1024" "32.00" "-"
+            st="stopped"
+            for r in ${QM_RUNNING_VMIDS:-}; do [[ "$r" == "$id" ]] && st="running"; done
+            printf '%10s %-20s %-10s %-10s %-12s %s\n' "$id" "vm-$id" "$st" "1024" "32.00" "-"
         done
         ;;
     set)
