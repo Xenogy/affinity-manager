@@ -1021,8 +1021,16 @@ apply_disk_throttle_to_vm() {
 dt_calibrate_one_vg() {
     local vg="$1" sid="$2" jsonf="$3"
     local size_g="${DT_CALIB_SIZE_G:-4}" rt="${DT_CALIB_RUNTIME:-15}"
+    local njobs="${DT_CALIB_NUMJOBS:-4}" engine="${DT_CALIB_IOENGINE:-auto}"
     local lvname="am-calib-$$" type thinpool dev io_json bw_json ir iw rd_bps wr_bps nice=""
     command -v ionice &> /dev/null && nice="ionice -c3"
+    # Prefer io_uring (≈1 syscall/IO, saturates the device with fewer cores);
+    # fall back to libaio. A single under-queued job measured far below the
+    # device ceiling, so we drive it with numjobs concurrent jobs instead of
+    # adding cores -- 4 jobs already clear hundreds of k IOPS on a few cores.
+    if [[ "$engine" == "auto" ]]; then
+        if fio --enghelp 2>/dev/null | grep -qw io_uring; then engine=io_uring; else engine=libaio; fi
+    fi
 
     if lvs "${vg}/${lvname}" &> /dev/null; then
         warn "  Calib LV ${vg}/${lvname} already exists; skipping VG $vg."; return 1
@@ -1057,13 +1065,23 @@ dt_calibrate_one_vg() {
     # shellcheck disable=SC2064
     trap "lvremove -f '${vg}/${lvname}' >/dev/null 2>&1 || true; DT_ACTIVE_CALIB_LV=''" RETURN
 
-    log "  Calibrating VG $vg on $dev (${size_g}G scratch, ${rt}s/job)..."
-    io_json=$($nice fio --name=cal --filename="$dev" --direct=1 --ioengine=libaio \
-        --rw=randrw --rwmixread=50 --bs=4k --iodepth=32 --runtime="$rt" --time_based \
-        --group_reporting --output-format=json 2>/dev/null) || { warn "  VG $vg: fio (iops) failed."; return 1; }
-    bw_json=$($nice fio --name=cal --filename="$dev" --direct=1 --ioengine=libaio \
-        --rw=rw --rwmixread=50 --bs=1M --iodepth=8 --runtime="$rt" --time_based \
-        --group_reporting --output-format=json 2>/dev/null) || { warn "  VG $vg: fio (bw) failed."; return 1; }
+    log "  Calibrating VG $vg on $dev (${size_g}G scratch, ${engine}, ${njobs} jobs, ${rt}s/job)..."
+    # Precondition: fully provision/map the thin LV first, so the measured runs
+    # hit already-allocated chunks. Otherwise thin first-write allocation (and
+    # optional chunk zeroing) understates sequential bandwidth badly.
+    $nice fio --name=precond --filename="$dev" --direct=1 --ioengine="$engine" \
+        --rw=write --bs=1M --iodepth=16 --size="${size_g}G" \
+        --output-format=json > /dev/null 2>&1 </dev/null \
+        || warn "  VG $vg: preconditioning pass failed (continuing; MB/s may read low)."
+
+    io_json=$($nice fio --name=cal --filename="$dev" --direct=1 --ioengine="$engine" \
+        --rw=randrw --rwmixread=50 --bs=4k --iodepth=32 --numjobs="$njobs" \
+        --runtime="$rt" --time_based --group_reporting --output-format=json 2>/dev/null </dev/null) \
+        || { warn "  VG $vg: fio (iops) failed."; return 1; }
+    bw_json=$($nice fio --name=cal --filename="$dev" --direct=1 --ioengine="$engine" \
+        --rw=rw --rwmixread=50 --bs=1M --iodepth=16 --numjobs=2 \
+        --runtime="$rt" --time_based --group_reporting --output-format=json 2>/dev/null </dev/null) \
+        || { warn "  VG $vg: fio (bw) failed."; return 1; }
 
     ir=$(echo "$io_json" | jq -r '.jobs[0].read.iops  // 0 | floor'); iw=$(echo "$io_json" | jq -r '.jobs[0].write.iops // 0 | floor')
     rd_bps=$(echo "$bw_json" | jq -r '.jobs[0].read.bw_bytes // 0 | floor'); wr_bps=$(echo "$bw_json" | jq -r '.jobs[0].write.bw_bytes // 0 | floor')
@@ -1087,6 +1105,14 @@ run_calibration_mode() {
         command -v "$c" &> /dev/null || error "--calibrate requires '$c'."
     done
     warn "CALIBRATION: creates a temporary LV per VG and runs fio against it -- this WILL perturb running VMs sharing that disk."
+    # The only truly clean capacity number comes from a QUIET host: fio competing
+    # with live guests measures contended (lower, irreproducible) throughput, and
+    # confined host cores cannot be fixed by stealing the VMs' cores. Warn loudly.
+    local _running
+    _running=$(qm list 2>/dev/null | awk 'NR>1 && $3=="running"{c++} END{print c+0}')
+    if [[ "$_running" =~ ^[0-9]+$ ]] && (( _running > 0 )); then
+        warn "  $_running VM(s) are RUNNING. Measurements will reflect contended, load-dependent capacity (caps may come out too low). For accurate, reproducible numbers, calibrate during a quiet window (VMs stopped/idle), or set capacity_overrides with known specs."
+    fi
     local -A vg_storage=()
     local vmid cfg did loc dom vg kind reason sid
     for vmid in $(jq -r '.vms // {} | keys[]' "$CONFIG_FILE"); do
