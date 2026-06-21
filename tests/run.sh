@@ -992,6 +992,23 @@ assert_grep "$WORK/run.log" "free data space.*skipping to avoid filling it" "nea
 assert_not_grep "$WORK/lvm-calls.log" "lvcreate" "no scratch LV created on a near-full pool"
 
 # -----------------------------------------------------------------------------
+scenario "over-commit warning fires on real floor pressure, not on rounding"
+make_storage_cfg
+make_vg_pvs pve /dev/nvme9n9
+# (1) a normal heuristic split with low floors must NOT warn -- the only overage
+# is sub-unit rounding of each cap, which the additive tolerance absorbs.
+write_config_with_throttle '{ "101": 2, "102": 2, "103": 2, "104": 2 }' \
+  '{ "enabled": true, "weighting": "equal", "global_headroom_pct": 25, "host_reserve": { "enabled": false }, "burst": { "enabled": false }, "floors": { "mbps_rd": 10, "mbps_wr": 10, "iops_rd": 10, "iops_wr": 10 } }'
+run_manager -f "$WORK/config.json" -n -g
+assert_exit_code 0 "$RUN_RC" "exits 0"
+assert_not_grep "$WORK/run.log" "over-committed" "rounding alone does not trigger the over-commit warning"
+# (2) tiny capacity + high floor genuinely cannot satisfy every VM's minimum -> warn.
+write_config_with_throttle '{ "101": 2, "102": 2, "103": 2, "104": 2 }' \
+  '{ "enabled": true, "weighting": "equal", "global_headroom_pct": 25, "host_reserve": { "enabled": false }, "burst": { "enabled": false }, "floors": { "mbps_rd": 30, "mbps_wr": 30, "iops_rd": 50, "iops_wr": 50 }, "capacity_overrides": { "vg:pve": { "seq_rd_mbps": 100, "seq_wr_mbps": 100, "iops_rd": 100, "iops_wr": 100 } } }'
+run_manager -f "$WORK/config.json" -n -g
+assert_grep "$WORK/run.log" "over-committed on.*iops_wr" "genuine floor over-commit still warns"
+
+# -----------------------------------------------------------------------------
 scenario "throttle disabled is a complete no-op"
 make_storage_cfg
 make_vg_pvs pve /dev/nvme9n9

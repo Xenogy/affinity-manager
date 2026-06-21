@@ -972,13 +972,17 @@ plan_disk_throttle() {
             fi
         done
 
-        # Over-subscription audit: floors can push the committed total past the
-        # allocatable pool. Honest warning rather than a silent false guarantee.
+        # Over-subscription audit: warn only when FLOORS genuinely push the
+        # committed total past the pool. The per-disk caps are rounded to the
+        # nearest integer, so the summed total can sit up to ~0.5 unit above its
+        # true share per disk; absorb that with an additive tolerance of one unit
+        # per consumer. Real floor over-commit overshoots by far more than that,
+        # so it still fires -- but harmless rounding no longer cries wolf.
         local over
         over=$(awk -v sr="$sum_rd" -v ar="$A_rd" -v sw="$sum_wr" -v aw="$A_wr" \
-                   -v si="$sum_ir" -v ai="$A_ir" -v sj="$sum_iw" -v aj="$A_iw" 'BEGIN{
-            o=""; if(sr>ar*1.0001)o=o" mbps_rd"; if(sw>aw*1.0001)o=o" mbps_wr";
-            if(si>ai*1.0001)o=o" iops_rd"; if(sj>aj*1.0001)o=o" iops_wr"; print o }')
+                   -v si="$sum_ir" -v ai="$A_ir" -v sj="$sum_iw" -v aj="$A_iw" -v nc="$nconsumers" 'BEGIN{
+            o=""; if(sr>ar+nc)o=o" mbps_rd"; if(sw>aw+nc)o=o" mbps_wr";
+            if(si>ai+nc)o=o" iops_rd"; if(sj>aj+nc)o=o" iops_wr"; print o }')
         if [[ -n "$over" ]]; then
             warn "  Domain $dom over-committed on:$over -- floors exceed the headroom budget. Caps stay at the floor (usable) but this disk cannot satisfy all VMs' minimums at once; consider fewer VMs per disk, lower floors, or faster storage."
         fi
