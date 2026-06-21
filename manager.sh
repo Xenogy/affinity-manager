@@ -21,10 +21,6 @@ PROC_CMDLINE_FILE="${PROC_CMDLINE_FILE:-/proc/cmdline}"
 # Fallback snippets dir for 'local:snippets/...' volids when pvesm cannot
 # resolve them (and the test override).
 SNIPPETS_FALLBACK_DIR="${SNIPPETS_FALLBACK_DIR:-/var/lib/vz/snippets}"
-# Disk I/O throttling touchpoints (all overridable for tests): block-device
-# sysfs root, the Proxmox storage definition, and the calibration cache.
-SYS_BLOCK_BASE="${SYS_BLOCK_BASE:-/sys/block}"
-PVE_STORAGE_CFG="${PVE_STORAGE_CFG:-/etc/pve/storage.cfg}"
 
 # Where this script (and its bundled extras/) lives -- used by --install-hook,
 # --install-irq-service and the hook drift check.
@@ -158,9 +154,6 @@ usage() {
     echo "                         local:snippets/vcpu-pin-hook.sh (or the -s value when given)."
     echo "  --install-irq-service: Install + enable the boot-time IRQ confinement unit, with"
     echo "                         ExecStart generated from this script and config path."
-    echo "  --calibrate:           Measure each LVM VG's real bandwidth/IOPS with fio on a"
-    echo "                         temporary LV, cache it, then exit. Opt-in; perturbs running"
-    echo "                         VMs. Feeds disk_throttle_settings (see README). Not with -n."
     exit 1
 }
 
@@ -306,18 +299,6 @@ STATEEOF
 
         IFS=',' read -ra assigned_cores_array <<< "$assigned_cores_str"
 
-        # Disk throttle plan for this VM (object of diskid -> {domain, opts}).
-        local disk_throttle_json="null" _tk _did _first=1
-        for _tk in "${!VM_DISK_THROTTLE_PLAN[@]}"; do
-            [[ "$_tk" == "${vmid}:"* ]] || continue
-            _did="${_tk#*:}"
-            if [[ "$disk_throttle_json" == "null" ]]; then disk_throttle_json="{"; fi
-            [[ $_first -eq 1 ]] || disk_throttle_json+=","
-            _first=0
-            disk_throttle_json+="\"${_did}\":{\"domain\":\"${VM_DISK_THROTTLE_DOMAIN[$_tk]:-}\",\"opts\":\"${VM_DISK_THROTTLE_PLAN[$_tk]}\"}"
-        done
-        [[ "$disk_throttle_json" != "null" ]] && disk_throttle_json+="}"
-
         cat >> "$state_file" << VMSTATEEOF
     "$vmid": {
       "name": "vm-${vmid}",
@@ -327,7 +308,6 @@ STATEEOF
             "disk_preference_source": $([ -n "$disk_source" ] && echo "\"$disk_source\"" || echo "null"),
             "disk_locality_matched": $([ -n "$disk_match" ] && echo "$disk_match" || echo "null"),
       "gpu_assigned": $([ -n "$gpu_info" ] && echo "\"$gpu_info ($mdev_info)\"" || echo "null"),
-      "disk_throttle": $disk_throttle_json,
       "assigned_physical_cores":[$(IFS=','; echo "${assigned_cores_array[*]}")]
     }$([ $vm_count -lt $total_vms ] && echo "," || echo "")
 VMSTATEEOF
@@ -599,554 +579,6 @@ detect_vm_disk_preference() {
     return 1
 }
 
-# =============================================================================
-# --- DISK I/O THROTTLE (auto-calculated per-VM bandwidth/IOPS limits) ---
-# =============================================================================
-# Problem: VMs sharing one physical disk starve each other -- one floods the
-# queue and everyone else's await/weighted-I/O-time explodes. Fix: partition
-# each physical disk's capacity among the VMs that sit on it, enforced host-side
-# by QEMU's per-disk throttle (qm set -<bus> ...,mbps_rd=,mbps_wr=,iops_rd=,
-# iops_wr=). Because QEMU enforces it, neighbors are protected regardless of
-# guest behavior.
-#
-# PRIMARY LEVER = IOPS. await ~= service_time/(1-utilization); the contention
-# that spikes await is small random I/O, whose binding limit is operations/sec,
-# not bytes/sec. MB/s caps are kept as a secondary guardrail against one VM
-# monopolizing sequential bandwidth, but the thing that actually bounds await is
-# the headroom discipline: summing all consumers' budgets to <= a fraction of the
-# disk's true capacity so the queue never plans to 100%.
-#
-# SCOPE: LVM / LVM-thin only (the common Proxmox-on-local-disk case). Every other
-# backend (ZFS, Ceph/RBD, NFS/CIFS, dir, raw paths, unknown) is detected and
-# SKIPPED WITH A WARNING -- never throttled from a guessed capacity. Capacity for
-# the LVM case comes from: explicit config overrides > fio calibration cache
-# (opt-in, --calibrate) > a conservative heuristic by device class. All math is
-# done in awk (float) -- never bash integer arithmetic, which would silently turn
-# "25% headroom" into a no-op.
-
-# Conservative capacity heuristic by device class.
-# echo "seq_rd_MB seq_wr_MB iops_rd iops_wr"  (decimal MB/s, 4k random IOPS)
-dt_class_caps() {
-    case "$1" in
-        hdd)             echo "150 150 100 100" ;;
-        sata-ssd)        echo "500 450 60000 30000" ;;
-        sas-ssd)         echo "900 800 120000 80000" ;;
-        nvme)            echo "1500 400 200000 40000" ;;   # consumer, post-SLC write
-        nvme-enterprise) echo "3000 2000 400000 150000" ;;
-        *) return 1 ;;
-    esac
-}
-
-# Round to nearest non-negative integer (awk: portable float -> int, half away).
-# Round to a positive integer. Used only for burst *_max ceilings, which must
-# stay >= the steady cap (>=1) -- a 0 here would mean "unlimited" to Proxmox.
-dt_round() { awk -v x="$1" 'BEGIN{ if (x<1) x=1; printf "%.0f", x }'; }
-
-# Storage type for a Proxmox storage id, from storage.cfg. echoes e.g. lvmthin.
-dt_storage_type() {
-    local sid="$1"
-    [[ -n "$sid" && -f "$PVE_STORAGE_CFG" ]] || return 1
-    awk -v want="$sid" '
-        /^[a-zA-Z]+:[ \t]/ { t=$1; sub(/:$/,"",t); if ($2==want){print t; exit} }
-    ' "$PVE_STORAGE_CFG"
-}
-
-# vgname for an lvm/lvmthin storage id, from storage.cfg.
-dt_lvm_vg_for_storage() {
-    local sid="$1"
-    [[ -n "$sid" && -f "$PVE_STORAGE_CFG" ]] || return 1
-    awk -v want="$sid" '
-        /^[a-zA-Z]+:[ \t]/ { inblk = ($2==want) ? 1 : 0 }
-        inblk && $1=="vgname" { print $2; exit }
-    ' "$PVE_STORAGE_CFG"
-}
-
-# Resolve a disk locator (storage:vol or /abs/path) to a capacity domain.
-# echo "domain_key|vg|kind|reason"   kind = lvm | skip
-dt_resolve_disk_domain() {
-    local loc="$1" sid type vg
-    [[ -n "$loc" ]] || { echo "|||skip:empty"; return 0; }
-    if [[ "$loc" == /* ]]; then echo "|||skip:rawpath"; return 0; fi
-    sid="${loc%%:*}"
-    type=$(dt_storage_type "$sid" 2>/dev/null || true)
-    case "$type" in
-        lvm|lvmthin)
-            vg=$(dt_lvm_vg_for_storage "$sid" 2>/dev/null || true)
-            [[ -n "$vg" ]] || vg="$sid"
-            echo "vg:${vg}|${vg}|lvm|" ;;
-        "")
-            # storage.cfg missing/unknown id: try the local-LVM convention where
-            # the storage id IS the VG name (matches resolve_storage_id_node).
-            if vgs --noheadings -o vg_name "$sid" &>/dev/null; then
-                echo "vg:${sid}|${sid}|lvm|"
-            else
-                echo "|${sid}||skip:unknown-storage"
-            fi ;;
-        *)
-            echo "|${sid}||skip:${type}" ;;
-    esac
-}
-
-# PV device paths backing a VG.
-dt_pvs_for_vg() { vgs --noheadings -o pv_name "$1" 2>/dev/null | awk 'NF{print $1}'; }
-
-# Base block device behind a PV path (strip partition / resolve dm parent).
-dt_base_block_dev() {
-    local p="$1" name base
-    name=$(basename "$p")
-    if command -v lsblk &> /dev/null; then
-        base=$(lsblk -ndo PKNAME "$p" 2>/dev/null | awk 'NF{print; exit}')
-        [[ -n "$base" ]] && { echo "$base"; return 0; }
-    fi
-    if [[ "$name" =~ ^(nvme[0-9]+n[0-9]+)p[0-9]+$ ]]; then echo "${BASH_REMATCH[1]}"; return 0; fi
-    if [[ "$name" =~ ^([a-zA-Z]+)[0-9]+$ ]]; then echo "${BASH_REMATCH[1]}"; return 0; fi
-    echo "$name"
-}
-
-# Device class for a PV path: nvme | sas-ssd | sata-ssd | hdd | unknown.
-dt_device_class() {
-    local pv="$1" base rot tran
-    base=$(dt_base_block_dev "$pv")
-    [[ "$base" == nvme* ]] && { echo "nvme"; return 0; }
-    rot=$(cat "${SYS_BLOCK_BASE}/${base}/queue/rotational" 2>/dev/null || echo "")
-    [[ "$rot" == "1" ]] && { echo "hdd"; return 0; }
-    if command -v lsblk &> /dev/null; then
-        tran=$(lsblk -ndo TRAN "/dev/${base}" 2>/dev/null | awk 'NF{print; exit}')
-        case "$tran" in sas) echo "sas-ssd"; return 0 ;; nvme) echo "nvme"; return 0 ;; esac
-    fi
-    [[ "$rot" == "0" ]] && { echo "sata-ssd"; return 0; }
-    echo "unknown"
-}
-
-# Explicit capacity override for a key. echo "rd_MB wr_MB iops_rd iops_wr" or nothing.
-dt_capacity_override() {
-    [[ -n "$1" ]] || return 0
-    jq -r --arg k "$1" '
-        (.disk_throttle_settings.capacity_overrides[$k]) as $o
-        | if $o == null then empty
-          else "\($o.seq_rd_mbps) \($o.seq_wr_mbps) \($o.iops_rd) \($o.iops_wr)" end
-    ' "$CONFIG_FILE" 2>/dev/null || true
-}
-
-# Calibration-cache capacity for a domain. echo "rd_Bps wr_Bps iops_rd iops_wr" or nothing.
-dt_calib_capacity() {
-    [[ -n "$1" && -f "$DT_CALIB_FILE" ]] || return 0
-    jq -r --arg k "$1" '
-        (.[$k]) as $o
-        | if $o == null then empty
-          else "\($o.rd_bps) \($o.wr_bps) \($o.iops_rd) \($o.iops_wr)" end
-    ' "$DT_CALIB_FILE" 2>/dev/null || true
-}
-
-# Resolve a domain's capacity (tiered). echo "rd_Bps|wr_Bps|iops_rd|iops_wr|source|class"
-dt_domain_capacity() {
-    local domain="$1" vg="$2" ov cal rd wr ird iwr class="" pv slow_rank=99 caps
-    declare -A _class_rank=( [unknown]=0 [hdd]=1 [sata-ssd]=2 [sas-ssd]=3 [nvme]=4 [nvme-enterprise]=5 )
-
-    # Tier 1: explicit override (by domain key, then by VG name).
-    ov=$(dt_capacity_override "$domain"); [[ -n "$ov" ]] || ov=$(dt_capacity_override "$vg")
-    if [[ -n "$ov" ]]; then
-        read -r rd wr ird iwr <<< "$ov"
-        echo "$(awk -v x="$rd" 'BEGIN{printf "%.0f", x*1000000}')|$(awk -v x="$wr" 'BEGIN{printf "%.0f", x*1000000}')|${ird}|${iwr}|override|override"
-        return 0
-    fi
-
-    # Tier 2: fio calibration cache (already in bytes/sec + ops).
-    cal=$(dt_calib_capacity "$domain")
-    if [[ -n "$cal" ]]; then
-        read -r rd wr ird iwr <<< "$cal"
-        echo "${rd}|${wr}|${ird}|${iwr}|calibration|measured"
-        return 0
-    fi
-
-    # Tier 3: heuristic from the slowest backing PV class.
-    while IFS= read -r pv; do
-        [[ -n "$pv" ]] || continue
-        local c; c=$(dt_device_class "$pv")
-        local rank=${_class_rank[$c]:-0}
-        if (( rank < slow_rank )) || [[ -z "$class" ]]; then class="$c"; slow_rank=$rank; fi
-    done < <(dt_pvs_for_vg "$vg")
-    [[ -n "$class" && "$class" != "unknown" ]] || class="$DT_UNKNOWN_CLASS"
-    caps=$(dt_class_caps "$class" 2>/dev/null || dt_class_caps "$DT_UNKNOWN_CLASS")
-    read -r rd wr ird iwr <<< "$caps"
-    echo "$(awk -v x="$rd" 'BEGIN{printf "%.0f", x*1000000}')|$(awk -v x="$wr" 'BEGIN{printf "%.0f", x*1000000}')|${ird}|${iwr}|heuristic|${class}"
-}
-
-# Per-disk steady-state cap for one dimension.
-#   args: C W weight headroom_pct host(0|1) reserve_pct derate floor
-# C and floor in the same unit (MiB/s for bandwidth, ops/s for iops); echoes int >=1.
-dt_alloc() {
-    awk -v C="$1" -v W="$2" -v w="$3" -v H="$4" -v host="$5" -v R="$6" -v D="$7" -v floor="$8" 'BEGIN{
-        A = C * (100-H)/100 * D;
-        if (host==1) A = A * (100-R)/100;
-        share = (W>0) ? A*w/W : 0;
-        v = (share>floor) ? share : floor;
-        if (v<1) v=1;
-        printf "%.0f", v;
-    }'
-}
-
-# Allocatable pool A for a dimension (for the over-subscription check / table).
-dt_pool() {
-    awk -v C="$1" -v H="$2" -v host="$3" -v R="$4" -v D="$5" 'BEGIN{
-        A = C*(100-H)/100*D; if(host==1) A=A*(100-R)/100; printf "%.4f", A;
-    }'
-}
-
-# Strip every pre-existing throttle key from a comma-separated disk-option string.
-# Anchored on commas + "=" so mbps_rd never eats mbps_rd_max and bare totals
-# (bps/mbps/iops) ARE removed (they are mutually exclusive with rd/wr keys).
-dt_strip_throttle_keys() {
-    local opts=",$1" k
-    for k in bps bps_rd bps_wr bps_max bps_rd_max bps_wr_max \
-             mbps mbps_rd mbps_wr mbps_max mbps_rd_max mbps_wr_max \
-             iops iops_rd iops_wr iops_max iops_rd_max iops_wr_max \
-             bps_max_length bps_rd_max_length bps_wr_max_length \
-             iops_max_length iops_rd_max_length iops_wr_max_length; do
-        opts=$(printf '%s' "$opts" | sed -E "s/,${k}=[^,]*//g")
-    done
-    printf '%s' "${opts#,}"
-}
-
-# Enumerate (diskid locator) pairs for a VM config, honoring scope.
-dt_vm_disk_locators() {
-    local cfg="$1" scope="$2" bootdisk line id loc
-    if [[ "$scope" == "boot_disk_only" ]]; then
-        bootdisk=$(get_vm_boot_disk_device "$cfg")
-        [[ -n "$bootdisk" ]] || return 0
-        line=$(echo "$cfg" | grep -m1 "^${bootdisk}:" || true)
-        loc=$(echo "$line" | awk '{print $2}' | cut -d',' -f1)
-        [[ -n "$loc" ]] && echo "${bootdisk} ${loc}"
-        return 0
-    fi
-    while IFS= read -r line; do
-        id=${line%%:*}
-        loc=$(echo "$line" | awk '{print $2}' | cut -d',' -f1)
-        [[ -n "$loc" ]] && echo "${id} ${loc}"
-    done < <(echo "$cfg" | grep -E '^(scsi|virtio|sata|ide)[0-9]+:' | grep -v 'media=cdrom')
-}
-
-# Domains the host OS itself sits on (root + configured extra paths) -> "vg:<VG>".
-dt_host_domains() {
-    local p src vg
-    for p in "/" "${DT_HOST_EXTRA_PATHS[@]}"; do
-        [[ -n "$p" ]] || continue
-        src=$(df --output=source "$p" 2>/dev/null | tail -n1 | xargs || true)
-        [[ "$src" == /dev/* ]] || continue
-        vg=$(lvs --noheadings -o vg_name "$src" 2>/dev/null | xargs || true)
-        [[ -n "$vg" ]] && echo "vg:${vg}"
-    done | sort -u
-}
-
-# Plan + apply state (global so execute_one_vm can read the plan).
-declare -gA VM_DISK_THROTTLE_PLAN VM_DISK_THROTTLE_DOMAIN DOMAIN_VG
-
-# Build the device->consumers graph across ALL host VMs (so the divisor is
-# honest even when foreign VMs share a disk), size each domain, reserve host
-# headroom, split by core-weight, and emit per-managed-disk throttle specs.
-# Pure compute + logging -- mutates nothing; runs in dry-run too.
-plan_disk_throttle() {
-    [[ "${DT_ENABLED:-0}" == "1" ]] || return 0
-    log "--- PHASE 3.4: Planning Disk I/O Throttle ---"
-
-    local -A host_dom=()
-    local hd
-    while IFS= read -r hd; do [[ -n "$hd" ]] && host_dom["$hd"]=1; done < <(dt_host_domains)
-
-    # Consumer universe = managed VMs UNION every VM `qm list` reports.
-    local -a all_vmids=()
-    local -A _seen=()
-    local v
-    for v in "${!VMS_TO_CONFIGURE[@]}"; do all_vmids+=("$v"); _seen["$v"]=1; done
-    while IFS= read -r v; do
-        [[ "$v" =~ ^[0-9]+$ ]] || continue
-        [[ -v _seen["$v"] ]] && continue
-        all_vmids+=("$v"); _seen["$v"]=1
-    done < <(qm list 2>/dev/null | awk 'NR>1{print $1}')
-
-    local -A dom_disklist=() dom_seen=()
-    local -a domains=()
-    local vmid cfg cores managed wt did loc dom vg kind reason
-    for vmid in "${all_vmids[@]}"; do
-        cfg=$(qm config "$vmid" 2>/dev/null || true)
-        [[ -n "$cfg" ]] || continue
-        if [[ -v VMS_TO_CONFIGURE["$vmid"] ]]; then
-            managed=1; cores=${VMS_TO_CONFIGURE[$vmid]}
-        else
-            managed=0; cores=$(echo "$cfg" | awk '/^cores:/{print $2; exit}')
-            [[ "$cores" =~ ^[0-9]+$ ]] || cores=1
-        fi
-        # Weight per the configured mode. Foreign VMs (no explicit weight) and the
-        # cores mode both fall back to core count; equal mode is a flat 1.
-        case "$DT_WEIGHTING" in
-            equal) wt=1 ;;
-            explicit)
-                wt=$(jq -r --arg v "$vmid" '.disk_throttle_settings.weights[$v] // empty' "$CONFIG_FILE" 2>/dev/null)
-                [[ "$wt" =~ ^[0-9]+$ ]] && (( wt >= 1 )) || wt=$cores ;;
-            *) wt=$cores ;;
-        esac
-        while read -r did loc; do
-            [[ -n "$did" && -n "$loc" ]] || continue
-            IFS='|' read -r dom vg kind reason <<< "$(dt_resolve_disk_domain "$loc")"
-            if [[ "$kind" != "lvm" ]]; then
-                [[ $managed -eq 1 ]] && warn "  VM $vmid $did ($loc): ${reason#skip:} storage -- not throttled (no safe local capacity model)."
-                continue
-            fi
-            if [[ ! -v dom_seen["$dom"] ]]; then dom_seen["$dom"]=1; domains+=("$dom"); DOMAIN_VG["$dom"]="$vg"; fi
-            dom_disklist["$dom"]+="${vmid}:${did}:${wt}:${managed} "
-        done < <(dt_vm_disk_locators "$cfg" "$DT_SCOPE")
-    done
-
-    if (( ${#domains[@]} == 0 )); then
-        log "  No throttleable LVM disks found among managed VMs; nothing to plan."
-        return 0
-    fi
-
-    local cap_rd cap_wr cap_ir cap_iw csrc cclass host_flag entry w mg
-    local cap_rd_mib cap_wr_mib W nconsumers nmanaged
-    for dom in "${domains[@]}"; do
-        vg=${DOMAIN_VG[$dom]}
-        IFS='|' read -r cap_rd cap_wr cap_ir cap_iw csrc cclass <<< "$(dt_domain_capacity "$dom" "$vg")"
-        host_flag=0; [[ -v host_dom["$dom"] ]] && host_flag=1
-        cap_rd_mib=$(awk -v x="$cap_rd" 'BEGIN{printf "%.4f", x/1048576}')
-        cap_wr_mib=$(awk -v x="$cap_wr" 'BEGIN{printf "%.4f", x/1048576}')
-
-        W=0; nconsumers=0; nmanaged=0
-        for entry in ${dom_disklist[$dom]}; do
-            IFS=':' read -r vmid did w mg <<< "$entry"
-            W=$((W + w)); nconsumers=$((nconsumers + 1)); [[ "$mg" == "1" ]] && nmanaged=$((nmanaged + 1))
-        done
-
-        log "  Domain $dom (VG $vg): class=$cclass source=$csrc host_shared=$([ $host_flag -eq 1 ] && echo yes || echo no) consumers=$nconsumers (managed $nmanaged) weight_sum=$W"
-        log "    capacity: rd=$(printf '%.0f' "$cap_rd_mib")MiB/s wr=$(printf '%.0f' "$cap_wr_mib")MiB/s iops_rd=$cap_ir iops_wr=$cap_iw | headroom=${DT_HEADROOM_PCT}%$([ $host_flag -eq 1 ] && echo " host_reserve=${DT_HOST_RESERVE_PCT}%")$(awk -v d="$DT_UNMANAGED_DERATE" 'BEGIN{if(d!=1)printf " derate=%s",d}')"
-
-        # Allocatable pools for the over-subscription audit.
-        local A_rd A_wr A_ir A_iw
-        A_rd=$(dt_pool "$cap_rd_mib" "$DT_HEADROOM_PCT" "$host_flag" "$DT_HOST_RESERVE_PCT" "$DT_UNMANAGED_DERATE")
-        A_wr=$(dt_pool "$cap_wr_mib" "$DT_HEADROOM_PCT" "$host_flag" "$DT_HOST_RESERVE_PCT" "$DT_UNMANAGED_DERATE")
-        A_ir=$(dt_pool "$cap_ir"     "$DT_HEADROOM_PCT" "$host_flag" "$DT_HOST_RESERVE_PCT" "$DT_UNMANAGED_DERATE")
-        A_iw=$(dt_pool "$cap_iw"     "$DT_HEADROOM_PCT" "$host_flag" "$DT_HOST_RESERVE_PCT" "$DT_UNMANAGED_DERATE")
-        local sum_rd=0 sum_wr=0 sum_ir=0 sum_iw=0
-
-        for entry in ${dom_disklist[$dom]}; do
-            IFS=':' read -r vmid did w mg <<< "$entry"
-            local prd pwr pir piw
-            prd=$(dt_alloc "$cap_rd_mib" "$W" "$w" "$DT_HEADROOM_PCT" "$host_flag" "$DT_HOST_RESERVE_PCT" "$DT_UNMANAGED_DERATE" "$DT_FLOOR_MBPS_RD")
-            pwr=$(dt_alloc "$cap_wr_mib" "$W" "$w" "$DT_HEADROOM_PCT" "$host_flag" "$DT_HOST_RESERVE_PCT" "$DT_UNMANAGED_DERATE" "$DT_FLOOR_MBPS_WR")
-            pir=$(dt_alloc "$cap_ir"     "$W" "$w" "$DT_HEADROOM_PCT" "$host_flag" "$DT_HOST_RESERVE_PCT" "$DT_UNMANAGED_DERATE" "$DT_FLOOR_IOPS_RD")
-            piw=$(dt_alloc "$cap_iw"     "$W" "$w" "$DT_HEADROOM_PCT" "$host_flag" "$DT_HOST_RESERVE_PCT" "$DT_UNMANAGED_DERATE" "$DT_FLOOR_IOPS_WR")
-            # committed toward the pool (managed honor floors; foreign reserve their raw share)
-            if [[ "$mg" == "1" ]]; then
-                sum_rd=$(awk -v a="$sum_rd" -v b="$prd" 'BEGIN{print a+b}')
-                sum_wr=$(awk -v a="$sum_wr" -v b="$pwr" 'BEGIN{print a+b}')
-                sum_ir=$(awk -v a="$sum_ir" -v b="$pir" 'BEGIN{print a+b}')
-                sum_iw=$(awk -v a="$sum_iw" -v b="$piw" 'BEGIN{print a+b}')
-
-                local opt=""
-                [[ "$DT_MBPS_ENABLED" == "1" ]] && opt+="mbps_rd=${prd},mbps_wr=${pwr},"
-                [[ "$DT_IOPS_ENABLED" == "1" ]] && opt+="iops_rd=${pir},iops_wr=${piw},"
-                if [[ "$DT_BURST_ENABLED" == "1" ]]; then
-                    if [[ "$DT_MBPS_ENABLED" == "1" ]]; then
-                        opt+="mbps_rd_max=$(dt_round "$(awk -v x="$prd" -v f="$DT_BURST_FACTOR" 'BEGIN{print x*f}')"),"
-                        opt+="mbps_wr_max=$(dt_round "$(awk -v x="$pwr" -v f="$DT_BURST_FACTOR" 'BEGIN{print x*f}')"),"
-                        opt+="bps_rd_max_length=${DT_BURST_LEN},bps_wr_max_length=${DT_BURST_LEN},"
-                    fi
-                    if [[ "$DT_IOPS_ENABLED" == "1" ]]; then
-                        opt+="iops_rd_max=$(dt_round "$(awk -v x="$pir" -v f="$DT_BURST_FACTOR" 'BEGIN{print x*f}')"),"
-                        opt+="iops_wr_max=$(dt_round "$(awk -v x="$piw" -v f="$DT_BURST_FACTOR" 'BEGIN{print x*f}')"),"
-                        opt+="iops_rd_max_length=${DT_BURST_LEN},iops_wr_max_length=${DT_BURST_LEN},"
-                    fi
-                fi
-                opt="${opt%,}"
-                if [[ -n "$opt" ]]; then
-                    VM_DISK_THROTTLE_PLAN["${vmid}:${did}"]="$opt"
-                    VM_DISK_THROTTLE_DOMAIN["${vmid}:${did}"]="$dom"
-                    log "    VM $vmid $did (weight=$w): $opt"
-                fi
-            else
-                sum_rd=$(awk -v a="$sum_rd" -v A="$A_rd" -v w="$w" -v W="$W" 'BEGIN{print a + (W>0?A*w/W:0)}')
-                sum_wr=$(awk -v a="$sum_wr" -v A="$A_wr" -v w="$w" -v W="$W" 'BEGIN{print a + (W>0?A*w/W:0)}')
-                sum_ir=$(awk -v a="$sum_ir" -v A="$A_ir" -v w="$w" -v W="$W" 'BEGIN{print a + (W>0?A*w/W:0)}')
-                sum_iw=$(awk -v a="$sum_iw" -v A="$A_iw" -v w="$w" -v W="$W" 'BEGIN{print a + (W>0?A*w/W:0)}')
-                log "    VM $vmid $did (weight=$w, FOREIGN/unmanaged): reserves its share, left unthrottled"
-            fi
-        done
-
-        # Over-subscription audit: floors can push the committed total past the
-        # allocatable pool. Honest warning rather than a silent false guarantee.
-        local over
-        over=$(awk -v sr="$sum_rd" -v ar="$A_rd" -v sw="$sum_wr" -v aw="$A_wr" \
-                   -v si="$sum_ir" -v ai="$A_ir" -v sj="$sum_iw" -v aj="$A_iw" 'BEGIN{
-            o=""; if(sr>ar*1.0001)o=o" mbps_rd"; if(sw>aw*1.0001)o=o" mbps_wr";
-            if(si>ai*1.0001)o=o" iops_rd"; if(sj>aj*1.0001)o=o" iops_wr"; print o }')
-        if [[ -n "$over" ]]; then
-            warn "  Domain $dom over-committed on:$over -- floors exceed the headroom budget. Caps stay at the floor (usable) but this disk cannot satisfy all VMs' minimums at once; consider fewer VMs per disk, lower floors, or faster storage."
-        fi
-        if (( nmanaged < nconsumers )); then
-            warn "  Domain $dom: $((nconsumers - nmanaged)) foreign VM disk(s) share this disk and are NOT throttled (not in config). They can still cause contention; add them to .vms to bound them."
-        fi
-    done
-    return 0
-}
-
-# Apply the planned throttle to one VM's managed disks. Reads a FRESH config
-# (so it preserves iothread=1 the caller may have just set), strips any old
-# throttle keys, appends the planned ones, and re-emits a throttle-only diff so
-# QEMU hot-applies it live (block_set_io_throttle) instead of staging it pending.
-apply_disk_throttle_to_vm() {
-    [[ "${DT_ENABLED:-0}" == "1" ]] || return 0
-    local vmid="$1" fresh key diskid throttle line spec vol opts newline any=0
-    for key in "${!VM_DISK_THROTTLE_PLAN[@]}"; do [[ "$key" == "${vmid}:"* ]] && { any=1; break; }; done
-    [[ $any -eq 1 ]] || return 0
-    fresh=$(qm config "$vmid" 2>/dev/null || true)
-    for key in "${!VM_DISK_THROTTLE_PLAN[@]}"; do
-        [[ "$key" == "${vmid}:"* ]] || continue
-        diskid="${key#*:}"
-        throttle="${VM_DISK_THROTTLE_PLAN[$key]}"
-        line=$(echo "$fresh" | grep -m1 "^${diskid}:" || true)
-        if [[ -z "$line" ]]; then warn "  VM $vmid: disk $diskid not found at apply time; throttle skipped."; continue; fi
-        spec=$(echo "$line" | sed -E "s/^${diskid}:[[:space:]]*//")
-        vol="${spec%%,*}"
-        if [[ "$spec" == *,* ]]; then opts=$(dt_strip_throttle_keys "${spec#*,}"); else opts=""; fi
-        newline="$vol"; [[ -n "$opts" ]] && newline="${newline},${opts}"
-        newline="${newline},${throttle}"
-        log "  Throttling $diskid: $throttle"
-        qm set "$vmid" -"$diskid" "$newline"
-    done
-}
-
-# Measure one VG's real capacity with fio on a throwaway LV, write bytes/sec +
-# IOPS into the calibration cache json ($3). The temp LV is ALWAYS removed (trap
-# RETURN), even on fio failure. Returns non-zero on any setup failure.
-dt_calibrate_one_vg() {
-    local vg="$1" sid="$2" jsonf="$3"
-    local size_g="${DT_CALIB_SIZE_G:-4}" rt="${DT_CALIB_RUNTIME:-15}"
-    local njobs="${DT_CALIB_NUMJOBS:-4}" engine="${DT_CALIB_IOENGINE:-auto}"
-    local lvname="am-calib-$$" type thinpool dev io_json bw_json ir iw rd_bps wr_bps nice=""
-    command -v ionice &> /dev/null && nice="ionice -c3"
-    # Prefer io_uring (≈1 syscall/IO, saturates the device with fewer cores);
-    # fall back to libaio. A single under-queued job measured far below the
-    # device ceiling, so we drive it with numjobs concurrent jobs instead of
-    # adding cores -- 4 jobs already clear hundreds of k IOPS on a few cores.
-    if [[ "$engine" == "auto" ]]; then
-        if fio --enghelp 2>/dev/null | grep -qw io_uring; then engine=io_uring; else engine=libaio; fi
-    fi
-
-    if lvs "${vg}/${lvname}" &> /dev/null; then
-        warn "  Calib LV ${vg}/${lvname} already exists; skipping VG $vg."; return 1
-    fi
-    type=$(dt_storage_type "$sid" 2>/dev/null || echo "")
-    # --yes auto-confirms LVM's thin-pool over-provisioning prompt (creating an
-    # 8G scratch volume on an over-provisioned pool otherwise BLOCKS on a y/n
-    # read); </dev/null guarantees no lvcreate prompt can ever hang on the TTY.
-    if [[ "$type" == "lvmthin" ]]; then
-        thinpool=$(awk -v want="$sid" '/^[a-zA-Z]+:[ \t]/{inblk=($2==want)} inblk&&$1=="thinpool"{print $2;exit}' "$PVE_STORAGE_CFG")
-        [[ -n "$thinpool" ]] || { warn "  VG $vg: no thinpool for storage $sid; skipping."; return 1; }
-        # Refuse to calibrate if the thin pool lacks comfortable free DATA space:
-        # a scratch volume's writes allocate real pool blocks and could fill a
-        # near-full pool, stalling every VM on it. need ~= size * 1.1.
-        local pool_free_b need_b
-        pool_free_b=$(lvs --noheadings --units b --nosuffix -o lv_size,data_percent "${vg}/${thinpool}" 2>/dev/null \
-            | awk 'NF{ dp=($2==""?0:$2); printf "%.0f", $1*(100-dp)/100 }')
-        need_b=$(awk -v g="$size_g" 'BEGIN{ printf "%.0f", g*1073741824*1.1 }')
-        if [[ "$pool_free_b" =~ ^[0-9]+$ ]] && (( pool_free_b < need_b )); then
-            warn "  VG $vg: thin pool '$thinpool' has only ~$((pool_free_b/1073741824))GiB free data space (need ~$((need_b/1073741824))GiB); skipping to avoid filling it. Lower DT_CALIB_SIZE_G to override."
-            return 1
-        fi
-        lvcreate --yes -n "$lvname" -V "${size_g}G" --thinpool "$thinpool" "$vg" > /dev/null 2>&1 </dev/null || { warn "  VG $vg: lvcreate (thin) failed."; return 1; }
-    else
-        lvcreate --yes -n "$lvname" -L "${size_g}G" "$vg" > /dev/null 2>&1 </dev/null || { warn "  VG $vg: lvcreate failed."; return 1; }
-    fi
-    dev="/dev/${vg}/${lvname}"
-    # Track the live scratch LV so the signal trap in run_calibration_mode can
-    # remove it if the user Ctrl-C's mid-benchmark; the RETURN trap covers the
-    # normal/early exit paths below.
-    DT_ACTIVE_CALIB_LV="${vg}/${lvname}"
-    # shellcheck disable=SC2064
-    trap "lvremove -f '${vg}/${lvname}' >/dev/null 2>&1 || true; DT_ACTIVE_CALIB_LV=''" RETURN
-
-    log "  Calibrating VG $vg on $dev (${size_g}G scratch, ${engine}, ${njobs} jobs, ${rt}s/job)..."
-    # Precondition: fully provision/map the thin LV first, so the measured runs
-    # hit already-allocated chunks. Otherwise thin first-write allocation (and
-    # optional chunk zeroing) understates sequential bandwidth badly.
-    $nice fio --name=precond --filename="$dev" --direct=1 --ioengine="$engine" \
-        --rw=write --bs=1M --iodepth=16 --size="${size_g}G" \
-        --output-format=json > /dev/null 2>&1 </dev/null \
-        || warn "  VG $vg: preconditioning pass failed (continuing; MB/s may read low)."
-
-    io_json=$($nice fio --name=cal --filename="$dev" --direct=1 --ioengine="$engine" \
-        --rw=randrw --rwmixread=50 --bs=4k --iodepth=32 --numjobs="$njobs" \
-        --runtime="$rt" --time_based --group_reporting --output-format=json 2>/dev/null </dev/null) \
-        || { warn "  VG $vg: fio (iops) failed."; return 1; }
-    bw_json=$($nice fio --name=cal --filename="$dev" --direct=1 --ioengine="$engine" \
-        --rw=rw --rwmixread=50 --bs=1M --iodepth=16 --numjobs=2 \
-        --runtime="$rt" --time_based --group_reporting --output-format=json 2>/dev/null </dev/null) \
-        || { warn "  VG $vg: fio (bw) failed."; return 1; }
-
-    ir=$(echo "$io_json" | jq -r '.jobs[0].read.iops  // 0 | floor'); iw=$(echo "$io_json" | jq -r '.jobs[0].write.iops // 0 | floor')
-    rd_bps=$(echo "$bw_json" | jq -r '.jobs[0].read.bw_bytes // 0 | floor'); wr_bps=$(echo "$bw_json" | jq -r '.jobs[0].write.bw_bytes // 0 | floor')
-    [[ "$ir" =~ ^[0-9]+$ && "$iw" =~ ^[0-9]+$ && "$rd_bps" =~ ^[0-9]+$ && "$wr_bps" =~ ^[0-9]+$ ]] || { warn "  VG $vg: could not parse fio output."; return 1; }
-
-    if jq --arg k "vg:${vg}" --argjson rd "$rd_bps" --argjson wr "$wr_bps" --argjson ir "$ir" --argjson iw "$iw" \
-        '.[$k] = {rd_bps:$rd, wr_bps:$wr, iops_rd:$ir, iops_wr:$iw}' "$jsonf" > "${jsonf}.tmp" 2>/dev/null \
-        && mv "${jsonf}.tmp" "$jsonf"; then
-        log "    VG $vg: rd=$((rd_bps/1048576))MiB/s wr=$((wr_bps/1048576))MiB/s iops_rd=$ir iops_wr=$iw"
-        return 0
-    fi
-    rm -f "${jsonf}.tmp"
-    warn "  VG $vg: measured but could not write the calibration cache."
-    return 1
-}
-
-# --calibrate driver: discover managed VMs' LVM VGs, calibrate each, persist.
-run_calibration_mode() {
-    [[ $DRY_RUN -eq 1 ]] && error "--calibrate performs real I/O (temp LV + fio); not allowed with -n."
-    for c in fio lvcreate lvremove lvs jq qm; do
-        command -v "$c" &> /dev/null || error "--calibrate requires '$c'."
-    done
-    warn "CALIBRATION: creates a temporary LV per VG and runs fio against it -- this WILL perturb running VMs sharing that disk."
-    # The only truly clean capacity number comes from a QUIET host: fio competing
-    # with live guests measures contended (lower, irreproducible) throughput, and
-    # confined host cores cannot be fixed by stealing the VMs' cores. Warn loudly.
-    local _running
-    _running=$(qm list 2>/dev/null | awk 'NR>1 && $3=="running"{c++} END{print c+0}')
-    if [[ "$_running" =~ ^[0-9]+$ ]] && (( _running > 0 )); then
-        warn "  $_running VM(s) are RUNNING. Measurements will reflect contended, load-dependent capacity (caps may come out too low). For accurate, reproducible numbers, calibrate during a quiet window (VMs stopped/idle), or set capacity_overrides with known specs."
-    fi
-    local -A vg_storage=()
-    local vmid cfg did loc dom vg kind reason sid
-    for vmid in $(jq -r '.vms // {} | keys[]' "$CONFIG_FILE"); do
-        cfg=$(qm config "$vmid" 2>/dev/null || true); [[ -n "$cfg" ]] || continue
-        while read -r did loc; do
-            [[ -n "$loc" ]] || continue
-            sid="${loc%%:*}"
-            IFS='|' read -r dom vg kind reason <<< "$(dt_resolve_disk_domain "$loc")"
-            [[ "$kind" == "lvm" ]] || continue
-            [[ -v vg_storage["$vg"] ]] || vg_storage["$vg"]="$sid"
-        done < <(dt_vm_disk_locators "$cfg" "all_disks")
-    done
-    (( ${#vg_storage[@]} > 0 )) || { log "No LVM VGs among managed VMs to calibrate."; return 0; }
-    local jsonf; jsonf=$(mktemp)
-    if [[ -f "$DT_CALIB_FILE" ]]; then cp "$DT_CALIB_FILE" "$jsonf"; else echo "{}" > "$jsonf"; fi
-    # If the user Ctrl-C's mid-benchmark, remove whatever scratch LV is live so
-    # it never leaks (the per-VG RETURN trap only covers normal returns).
-    DT_ACTIVE_CALIB_LV=""
-    trap 'if [[ -n "${DT_ACTIVE_CALIB_LV:-}" ]]; then lvremove -f "$DT_ACTIVE_CALIB_LV" >/dev/null 2>&1 || true; fi; warn "Calibration interrupted; scratch LV cleaned up."; exit 130' INT TERM
-    for vg in "${!vg_storage[@]}"; do
-        dt_calibrate_one_vg "$vg" "${vg_storage[$vg]}" "$jsonf" \
-            || warn "  Calibration failed for VG $vg; its prior/heuristic capacity stands."
-    done
-    trap - INT TERM
-    # dt_calibrate_one_vg's RETURN trap persists into this scope (bash without
-    # set -T); clear it so it does not re-fire on our return with a stale name.
-    trap - RETURN
-    if ! mv "$jsonf" "$DT_CALIB_FILE" 2>/dev/null; then
-        rm -f "$jsonf"
-        error "Could not write calibration cache to $DT_CALIB_FILE."
-    fi
-    log "Calibration cache written: $DT_CALIB_FILE"
-}
-
 # --- ARGUMENT PARSING ---
 CONFIG_FILE=""
 DRY_RUN=0
@@ -1160,7 +592,6 @@ CONFINE_IRQS_ONLY=0
 INSTALL_HOOK=0
 INSTALL_HOOK_VOLID=""
 INSTALL_IRQ_SERVICE=0
-CALIBRATE_MODE=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -1184,7 +615,6 @@ while [[ $# -gt 0 ]]; do
             if [[ $# -gt 1 && "$2" != -* ]]; then INSTALL_HOOK_VOLID="$2"; shift 2; else shift; fi
             ;;
         --install-irq-service) INSTALL_IRQ_SERVICE=1; shift ;;
-        --calibrate) CALIBRATE_MODE=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) error "Unknown option: $1" ;;
     esac
@@ -1301,75 +731,6 @@ fi
 # only after Phase 4 succeeds. applied=false therefore means "planned, but not
 # (fully) on the host".
 STATE_APPLIED="false"
-
-
-# --- DISK I/O THROTTLE CONFIG ---
-# All knobs optional; absent or enabled:false => the feature is fully inert.
-# The calibration cache is shared between dry and real runs (drop any .dryrun).
-DT_CALIB_FILE="${DT_CALIB_FILE:-${STATE_FILE%.dryrun}.throttle-calib.json}"
-dt_cfg() { jq -r "$1" "$CONFIG_FILE" 2>/dev/null; }
-dt_bool() { [[ "$1" == "true" || "$1" == "1" ]] && echo 1 || echo 0; }
-
-DT_ENABLED=$(dt_bool "$(dt_cfg '.disk_throttle_settings.enabled // false')")
-DT_WEIGHTING=$(dt_cfg '.disk_throttle_settings.weighting // "cores"')
-DT_HEADROOM_PCT=$(dt_cfg '.disk_throttle_settings.global_headroom_pct // 25')
-DT_HOST_RESERVE_ENABLED=$(dt_bool "$(dt_cfg '.disk_throttle_settings.host_reserve.enabled // true')")
-DT_HOST_RESERVE_PCT=$(dt_cfg '.disk_throttle_settings.host_reserve.reserve_pct // 20')
-DT_IOPS_ENABLED=$(dt_bool "$(dt_cfg '.disk_throttle_settings.iops_enabled // true')")
-DT_MBPS_ENABLED=$(dt_bool "$(dt_cfg '.disk_throttle_settings.mbps_enabled // true')")
-DT_SCOPE=$(dt_cfg '.disk_throttle_settings.scope // "all_disks"')
-DT_FLOOR_MBPS_RD=$(dt_cfg '.disk_throttle_settings.floors.mbps_rd // 30')
-DT_FLOOR_MBPS_WR=$(dt_cfg '.disk_throttle_settings.floors.mbps_wr // 30')
-DT_FLOOR_IOPS_RD=$(dt_cfg '.disk_throttle_settings.floors.iops_rd // 50')
-DT_FLOOR_IOPS_WR=$(dt_cfg '.disk_throttle_settings.floors.iops_wr // 50')
-DT_BURST_ENABLED=$(dt_bool "$(dt_cfg '.disk_throttle_settings.burst.enabled // false')")
-DT_BURST_FACTOR=$(dt_cfg '.disk_throttle_settings.burst.factor // 1.25')
-DT_BURST_LEN=$(dt_cfg '.disk_throttle_settings.burst.length_seconds // 10')
-DT_UNKNOWN_CLASS=$(dt_cfg '.disk_throttle_settings.unknown_class_default // "sata-ssd"')
-DT_UNMANAGED_DERATE=$(dt_cfg '.disk_throttle_settings.unmanaged_derate // 1.0')
-# Extra host paths (besides /) to map onto a domain for the host-OS reserve.
-declare -a DT_HOST_EXTRA_PATHS=()
-if [[ "$DT_HOST_RESERVE_ENABLED" == "1" ]]; then
-    while IFS= read -r _p; do [[ -n "$_p" ]] && DT_HOST_EXTRA_PATHS+=("$_p"); done \
-        < <(dt_cfg '.disk_throttle_settings.host_reserve.extra_paths // ["/var/lib/vz"] | .[]')
-else
-    DT_HOST_RESERVE_PCT=0
-fi
-
-# Validate strictly when the feature (or calibration) is actually in play -- a
-# disabled block never aborts the run on a stray value.
-if [[ "$DT_ENABLED" == "1" || "$CALIBRATE_MODE" == "1" ]]; then
-    dt_need_int() { [[ "$2" =~ ^[0-9]+$ ]] && (( $2 >= $3 && $2 <= $4 )) || error "disk_throttle_settings.$1 must be an integer in [$3,$4] (got '$2')."; }
-    dt_need_num() { [[ "$2" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v x="$2" -v m="$3" 'BEGIN{exit !(x>=m)}' || error "disk_throttle_settings.$1 must be a number >= $3 (got '$2')."; }
-    dt_need_int "global_headroom_pct" "$DT_HEADROOM_PCT" 0 99
-    dt_need_int "host_reserve.reserve_pct" "$DT_HOST_RESERVE_PCT" 0 99
-    dt_need_int "floors.mbps_rd" "$DT_FLOOR_MBPS_RD" 0 1000000
-    dt_need_int "floors.mbps_wr" "$DT_FLOOR_MBPS_WR" 0 1000000
-    dt_need_int "floors.iops_rd" "$DT_FLOOR_IOPS_RD" 0 100000000
-    dt_need_int "floors.iops_wr" "$DT_FLOOR_IOPS_WR" 0 100000000
-    dt_need_int "burst.length_seconds" "$DT_BURST_LEN" 0 3600
-    dt_need_num "burst.factor" "$DT_BURST_FACTOR" 1.0
-    dt_need_num "unmanaged_derate" "$DT_UNMANAGED_DERATE" 0.01
-    case "$DT_WEIGHTING" in equal|cores|explicit) ;; *) error "disk_throttle_settings.weighting must be equal|cores|explicit (got '$DT_WEIGHTING')." ;; esac
-    case "$DT_SCOPE" in all_disks|boot_disk_only) ;; *) error "disk_throttle_settings.scope must be all_disks|boot_disk_only (got '$DT_SCOPE')." ;; esac
-    case "$DT_UNKNOWN_CLASS" in hdd|sata-ssd|sas-ssd|nvme|nvme-enterprise) ;; *) error "disk_throttle_settings.unknown_class_default invalid (got '$DT_UNKNOWN_CLASS')." ;; esac
-    if [[ "$DT_ENABLED" == "1" && "$DT_IOPS_ENABLED" == "0" && "$DT_MBPS_ENABLED" == "0" ]]; then
-        error "disk_throttle_settings: both iops_enabled and mbps_enabled are false -- nothing to throttle."
-    fi
-    # Concurrent bursts across N consumers can exceed device capacity. Warn when
-    # the burst ceiling pierces the headroom (factor * (1-headroom) > 1).
-    if [[ "$DT_BURST_ENABLED" == "1" ]]; then
-        awk -v f="$DT_BURST_FACTOR" -v h="$DT_HEADROOM_PCT" 'BEGIN{exit !(f*(100-h)/100 > 1.0)}' \
-            && warn "disk_throttle_settings.burst.factor=$DT_BURST_FACTOR with headroom=${DT_HEADROOM_PCT}% lets concurrent bursts exceed device capacity; consider factor <= $(awk -v h="$DT_HEADROOM_PCT" 'BEGIN{printf "%.2f", 100/(100-h)}')."
-    fi
-fi
-
-# --- CALIBRATION MODE (--calibrate): measure capacity, write cache, exit ---
-# Opt-in and perturbing (creates a temp LV + runs fio); never runs under -n.
-if [[ "$CALIBRATE_MODE" == "1" ]]; then
-    run_calibration_mode
-    exit 0
-fi
 
 
 # =============================================================================
@@ -2951,10 +2312,6 @@ for node_id in "${NUMA_NODE_IDS[@]}"; do
     fi
 done
 
-# Disk I/O throttle planning (pure compute + dry-run table; mutates nothing).
-# Failure here must never block the core affinity work.
-plan_disk_throttle || warn "Disk throttle planning failed; continuing without throttle."
-
 create_state_file
 log "Planning Complete."
 
@@ -3179,11 +2536,6 @@ execute_one_vm() {
 
         if [[ -n "$HOOK_SCRIPT_PATH" ]]; then qm set "$vmid" --hookscript "$HOOK_SCRIPT_PATH"; fi
 
-        # Disk I/O throttle: a throttle-only diff on each managed disk, read from
-        # FRESH config so the iothread=1 just set above is preserved. QEMU hot-
-        # applies throttle live (block_set_io_throttle), so it does not go pending.
-        apply_disk_throttle_to_vm "$vmid"
-
         # qm set on a RUNNING VM stages most of these options as "pending"
         # changes that only take effect at the next power cycle. Detect that
         # and say so, instead of implying the new pinning is already live.
@@ -3202,14 +2554,6 @@ execute_one_vm() {
             log "  [DRY RUN] Set GPU: $gpu_pci ($gpu_mdev)"
         elif [[ $SKIP_GPU -eq 0 ]]; then
             warn "  [DRY RUN] No GPU assigned (best-effort fallback)."
-        fi
-        if [[ "${DT_ENABLED:-0}" == "1" ]]; then
-            local _tk
-            for _tk in "${!VM_DISK_THROTTLE_PLAN[@]}"; do
-                if [[ "$_tk" == "${vmid}:"* ]]; then
-                    log "  [DRY RUN] Throttle ${_tk#*:}: ${VM_DISK_THROTTLE_PLAN[$_tk]}"
-                fi
-            done
         fi
     fi
 }

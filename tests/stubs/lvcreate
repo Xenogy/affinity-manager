@@ -1,4 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-[[ -n "${LVM_CALL_LOG:-}" ]] && printf 'lvcreate %s\n' "$*" >> "$LVM_CALL_LOG"
-exit 0

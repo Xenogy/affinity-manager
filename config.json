@@ -17,36 +17,6 @@
       "0000:04:00.0": "nvidia-47"
     }
   },
-  "disk_throttle_settings": {
-    "enabled": false,
-    "weighting": "cores",
-    "global_headroom_pct": 25,
-    "host_reserve": {
-      "enabled": true,
-      "reserve_pct": 20,
-      "extra_paths": [
-        "/var/lib/vz"
-      ]
-    },
-    "iops_enabled": true,
-    "mbps_enabled": true,
-    "scope": "all_disks",
-    "floors": {
-      "mbps_rd": 30,
-      "mbps_wr": 30,
-      "iops_rd": 50,
-      "iops_wr": 50
-    },
-    "burst": {
-      "enabled": false,
-      "factor": 1.25,
-      "length_seconds": 10
-    },
-    "unknown_class_default": "sata-ssd",
-    "unmanaged_derate": 1.0,
-    "weights": {},
-    "capacity_overrides": {}
-  },
   "vms": {
     "101": 4,
     "102": 4,
