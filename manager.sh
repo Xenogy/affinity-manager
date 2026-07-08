@@ -149,6 +149,9 @@ usage() {
     echo "  -g:                    Skip GPU discovery and assignment (force CPU-only). Optional."
     echo "  -i:                    Only re-apply device IRQ confinement, then exit. Optional."
     echo "                         (For boot-time use: see extras/affinity-manager-irq.service.)"
+    echo "  --no-reserve:          Run without host core reservation (overrides reserve_host_cores):"
+    echo "                         all cores are available to VMs, and reservation applied by a"
+    echo "                         previous run (slices, drop-ins, GRUB params) is removed."
     echo "  --install-hook [volid]: Install/refresh extras/vcpu-pin-hook.sh on the snippets storage"
     echo "                         and attach it to every managed VM. Default volid:"
     echo "                         local:snippets/vcpu-pin-hook.sh (or the -s value when given)."
@@ -271,7 +274,7 @@ create_state_file() {
 {
   "metadata": {
     "timestamp": "$timestamp",
-        "version": "11.6-disk-locality+irq-confine+parallel",
+        "version": "11.7-no-reserve",
     "config_file": "$CONFIG_FILE",
     "dry_run": $([ $DRY_RUN -eq 1 ] && echo "true" || echo "false"),
     "applied": $STATE_APPLIED
@@ -589,6 +592,7 @@ BALANCE_SOCKETS=0
 CORES_PER_NUMA=1
 SKIP_GPU=0
 CONFINE_IRQS_ONLY=0
+NO_RESERVE=0
 INSTALL_HOOK=0
 INSTALL_HOOK_VOLID=""
 INSTALL_IRQ_SERVICE=0
@@ -610,6 +614,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         -g|--no-gpu) SKIP_GPU=1; shift ;;
         -i|--confine-irqs-only) CONFINE_IRQS_ONLY=1; shift ;;
+        --no-reserve) NO_RESERVE=1; shift ;;
         --install-hook)
             INSTALL_HOOK=1
             if [[ $# -gt 1 && "$2" != -* ]]; then INSTALL_HOOK_VOLID="$2"; shift 2; else shift; fi
@@ -646,6 +651,14 @@ fi
 if [[ $INSTALL_IRQ_SERVICE -eq 1 && $RESET_HOST_PINNING -eq 1 ]]; then
     warn "--install-irq-service is ignored with -r."
     INSTALL_IRQ_SERVICE=0
+fi
+# --no-reserve contradicts the modes that exist purely to reserve/confine:
+# fail at parse time instead of half-running one of them.
+if [[ $NO_RESERVE -eq 1 && $AUTO_HOST_CORES -eq 1 ]]; then
+    error "--no-reserve cannot be combined with -a/-b (they exist to select host cores to reserve)."
+fi
+if [[ $NO_RESERVE -eq 1 && $CONFINE_IRQS_ONLY -eq 1 ]]; then
+    error "--no-reserve cannot be combined with -i (IRQ confinement needs reserved host cores)."
 fi
 # --install-hook preconditions depend only on argv and the filesystem: fail
 # HERE, at parse time -- never in Phase 3.5 with host pinning already applied.
@@ -701,6 +714,7 @@ if [[ $RESET_HOST_PINNING -eq 1 ]]; then
     echo "  systemctl daemon-reexec"
     echo ""
     log "Run the above commands manually as root to reset all pinning."
+    log "(Or run: $0 -f $CONFIG_FILE --no-reserve  to have the script remove the reservation itself, including the GRUB isolation params.)"
     exit 0
 fi
 
@@ -741,6 +755,20 @@ log "--- PHASE 1: Discovering CPU Topology ---"
 CPU_CONFIG_STRING=$(jq -r '.global_settings.cpu_config_string // "host"' "$CONFIG_FILE")
 HOST_CORES_JSON=$(jq -r '.global_settings.host_cores //[]' "$CONFIG_FILE")
 RESERVE_HOST_CORES=$(jq -r '.global_settings.reserve_host_cores' "$CONFIG_FILE")
+# Anything but true/false/absent is a typo ("ture") that would silently disable
+# reservation -- and, since removal is active now, tear down existing pinning.
+case "$RESERVE_HOST_CORES" in
+    true|false|null) ;;
+    *) error "global_settings.reserve_host_cores must be true or false (got '$RESERVE_HOST_CORES')." ;;
+esac
+if [[ $NO_RESERVE -eq 1 ]]; then RESERVE_HOST_CORES="false"; fi
+if [[ $AUTO_HOST_CORES -eq 1 && "$RESERVE_HOST_CORES" != "true" ]]; then
+    error "-a/-b auto-select host cores to reserve, but global_settings.reserve_host_cores is not true."
+fi
+if [[ $INSTALL_IRQ_SERVICE -eq 1 && "$RESERVE_HOST_CORES" != "true" ]]; then
+    warn "--install-irq-service is ignored: host core reservation is disabled and the boot unit requires it."
+    INSTALL_IRQ_SERVICE=0
+fi
 
 declare -A CPU_TO_CORE CPU_TO_NODE CPU_TO_SOCKET SOCKET_IDS MIN_CORE_PER_SOCKET CORES_TO_RESERVE_MAP
 declare -A CPU_IS_SMT CPU_SIBLINGS CORE_KEY_CPUS
@@ -1172,6 +1200,122 @@ confine_device_irqs() {
     return 0
 }
 
+# irq_mask_confined_to_ex_host <cpulist>
+#   True if every CPU in the smp_affinity_list belongs to the FORMER host core
+#   set (EX_HOST_CORE_MAP) -- i.e. a mask confine_device_irqs would have
+#   written. Anything else (an admin's RSS pinning, a driver default) is not
+#   this script's doing and must be left alone on removal.
+irq_mask_confined_to_ex_host() {
+    local list="$1"
+    local token lo hi cpu
+    local -a tokens
+    IFS=',' read -ra tokens <<< "$list"
+    for token in "${tokens[@]}"; do
+        if [[ -z "$token" ]]; then continue; fi
+        if [[ "$token" == *-* ]]; then
+            lo=${token%%-*}; hi=${token##*-}
+        else
+            lo=$token; hi=$token
+        fi
+        if [[ ! "$lo" =~ ^[0-9]+$ || ! "$hi" =~ ^[0-9]+$ ]]; then return 1; fi
+        for (( cpu=lo; cpu<=hi; cpu++ )); do
+            if [[ ! -v EX_HOST_CORE_MAP["$cpu"] ]]; then return 1; fi
+        done
+    done
+    return 0
+}
+
+# release_device_irqs
+#   Inverse of confine_device_irqs, for reservation removal: device IRQs a
+#   previous run steered onto the (now unreserved) ex-host cores are widened
+#   back to the full CPU set, restoring the kernel's default placement freedom.
+#   Only masks entirely inside EX_HOST_CORE_MAP (the former host cores, filled
+#   in by remove_host_pinning) are touched -- any other placement is presumed
+#   deliberate and left alone. Same enumeration and opt-out as
+#   confine_device_irqs; managed IRQs that reject the write are counted, not
+#   warned (the kernel spreads those itself once the isolcpus params are gone
+#   and the host rebooted).
+release_device_irqs() {
+    local confine
+    confine=$(jq -r 'if .global_settings.confine_device_irqs == false then "false" else "true" end' "$CONFIG_FILE")
+    if [[ "$confine" != "true" ]]; then
+        log "  Device IRQ management disabled (global_settings.confine_device_irqs=false); leaving IRQ affinity alone."
+        return 0
+    fi
+
+    if (( ${#EX_HOST_CORE_MAP[@]} == 0 )); then
+        log "  Previous host cores unknown (no PID1 drop-in, no host_cores in config); leaving device IRQ affinity alone (it resets at reboot)."
+        return 0
+    fi
+
+    local ex_list
+    ex_list=$(printf '%s\n' "${!EX_HOST_CORE_MAP[@]}" | sort -nu | tr '\n' ',')
+    ex_list=${ex_list%,}
+
+    local full_range="0-${SMT_END}"
+    if (( SMT_END == 0 )); then full_range="0"; fi
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        log "  [DRY RUN] Would widen device IRQs confined to the ex-host cores ($ex_list) back to all CPUs: $full_range"
+    else
+        log "  Widening device IRQs confined to the ex-host cores ($ex_list) back to all CPUs: $full_range"
+    fi
+
+    local base="${IRQ_PROC_BASE:-/proc/irq}"
+    local path irq af list dev_name sub
+    local considered=0 widened=0 skipped=0 untouched=0 immovable=0
+
+    for path in "$base"/[0-9]*; do
+        if [[ ! -d "$path" ]]; then continue; fi
+        irq=${path##*/}
+
+        # Same device-IRQ identification as confine_device_irqs.
+        dev_name=""
+        for sub in "$path"/*/; do
+            if [[ ! -d "$sub" ]]; then continue; fi
+            dev_name=${sub%/}; dev_name=${dev_name##*/}
+            break
+        done
+        if [[ -z "$dev_name" && -r "$path/actions" ]]; then
+            dev_name=$(<"$path/actions")
+        fi
+        if [[ -z "$dev_name" ]]; then continue; fi
+
+        af="$path/smp_affinity_list"
+        if [[ ! -r "$af" ]]; then continue; fi
+        list=$(<"$af")
+        considered=$((considered + 1))
+
+        if [[ "$list" == "$full_range" ]]; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        if ! irq_mask_confined_to_ex_host "$list"; then
+            untouched=$((untouched + 1))
+            continue
+        fi
+
+        if [[ $DRY_RUN -eq 1 ]]; then
+            log "    [plan] IRQ $irq ($dev_name): $list -> $full_range"
+            widened=$((widened + 1))
+            continue
+        fi
+
+        if echo "$full_range" 2>/dev/null > "$af"; then
+            log "    IRQ $irq ($dev_name): $list -> $(<"$af")"
+            widened=$((widened + 1))
+        else
+            immovable=$((immovable + 1))
+        fi
+    done
+
+    local verb="widened"
+    if [[ $DRY_RUN -eq 1 ]]; then verb="to widen"; fi
+    log "  IRQ release: $widened $verb, $skipped already unconstrained, $untouched not confined to ex-host cores (left as-is), $immovable kernel-managed/immovable (of $considered device IRQs)."
+    return 0
+}
+
 if [[ "$RESERVE_HOST_CORES" == "true" ]]; then
     if [[ "$HOST_CORES_JSON" != "[]" && "$HOST_CORES_JSON" != "null" ]]; then
         while IFS= read -r core_id; do
@@ -1196,6 +1340,8 @@ if [[ "$RESERVE_HOST_CORES" == "true" ]]; then
     if [[ ${#CORES_TO_RESERVE[@]} -gt 0 && $CONFINE_IRQS_ONLY -eq 0 ]]; then
         log "Host core reservation: ${CORES_TO_RESERVE[*]} (host pinning is applied only after the VM plan validates)."
     fi
+elif [[ $CONFINE_IRQS_ONLY -eq 0 ]]; then
+    log "Host core reservation disabled ($([ $NO_RESERVE -eq 1 ] && echo '--no-reserve' || echo 'reserve_host_cores is not true')); all CPUs are available for VM placement."
 fi
 
 # -i: re-apply IRQ confinement only (e.g. from the boot-time systemd unit --
@@ -1422,6 +1568,198 @@ EOF
 
         apply_host_tuning
     }
+}
+
+# Remove host core reservation (reserve_host_cores=false or --no-reserve).
+# The inverse of apply_host_pinning: leftovers from a previous reserving run
+# actively fight an unreserved plan (a stale qemu.slice AllowedCPUs= keeps VMs
+# off the ex-host cores the planner just assigned), so converge the host to
+# "nothing reserved". Evidence-based: only drop-ins this script names, slice
+# properties recorded under system.control/, and GRUB isolation params bearing
+# its isolcpus=managed_irq,domain,... signature are touched -- a foreign
+# isolcpus is left alone (with a warning). Idempotent and honors DRY_RUN.
+remove_host_pinning() {
+    # With nothing reserved every CPU is a VM core -- apply_host_tuning's
+    # cpu_governor covers the full set.
+    vm_cores_list=()
+    local cpu_id
+    for cpu_id in $(seq 0 "$SMT_END"); do
+        if [[ -v CPU_TO_NODE["$cpu_id"] ]]; then vm_cores_list+=("$cpu_id"); fi
+    done
+
+    local pid1_conf="${SYSTEMD_ETC}/system.conf.d/99-host-cores.conf"
+    local qemu_conf="${SYSTEMD_ETC}/system/qemu.slice.d/99-vm-cores.conf"
+    local machine_conf="${SYSTEMD_ETC}/system/machine.slice.d/99-vm-cores.conf"
+
+    local grub_line="" cur_iso="" cur_nohz="" cur_rcu="" grub_ours=0
+    if [[ -f "$GRUB_FILE" ]]; then
+        grub_line=$(grep -m1 '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_FILE" || true)
+        # head -1: a (hand-edited) line with duplicated params would otherwise
+        # yield a multi-line value that silently never matches when stripping.
+        cur_iso=$(echo "$grub_line" | grep -oP "isolcpus=[^\s\"']+" | head -n1 || true)
+        cur_nohz=$(echo "$grub_line" | grep -oP "nohz_full=[^\s\"']+" | head -n1 || true)
+        cur_rcu=$(echo "$grub_line" | grep -oP "rcu_nocbs=[^\s\"']+" | head -n1 || true)
+    fi
+    if [[ "$cur_iso" == isolcpus=managed_irq,domain,* ]]; then grub_ours=1; fi
+
+    # The former host cores, for scoping the IRQ release to masks this script
+    # actually wrote: the PID1 drop-in is authoritative (it records exactly
+    # what the last apply reserved); the config's host_cores is the fallback.
+    # Read BEFORE the drop-in is deleted below.
+    declare -gA EX_HOST_CORE_MAP=()
+    local _ex_cores="" _ex
+    if [[ -f "$pid1_conf" ]]; then
+        _ex_cores=$(sed -n 's/^CPUAffinity=//p' "$pid1_conf" | head -n1)
+    fi
+    if [[ -n "$_ex_cores" ]]; then
+        for _ex in $_ex_cores; do
+            if [[ "$_ex" =~ ^[0-9]+$ ]]; then EX_HOST_CORE_MAP["$_ex"]=1; fi
+        done
+    elif [[ "$HOST_CORES_JSON" != "[]" && "$HOST_CORES_JSON" != "null" ]]; then
+        while IFS= read -r _ex; do
+            if [[ "$_ex" =~ ^[0-9]+$ ]]; then EX_HOST_CORE_MAP["$_ex"]=1; fi
+        done < <(echo "$HOST_CORES_JSON" | jq -r '.[]')
+    fi
+
+    # NOTE: system.control/<unit>.d/50-AllowedCPUs.conf is systemd's GENERIC
+    # persistence for `systemctl set-property` -- any tool or admin produces
+    # the identical file, so it is NOT evidence of this script's apply and
+    # never triggers removal by itself. It is only cleaned up alongside the
+    # slice resets once this script's own artifacts prove a prior apply.
+    local unit have_slice_props=0
+    for unit in system.slice user.slice init.scope; do
+        if [[ -f "${SYSTEMD_ETC}/system.control/${unit}.d/50-AllowedCPUs.conf" ]]; then
+            have_slice_props=1
+        fi
+    done
+
+    # The boot-time IRQ unit hard-requires a reservation; enabled without one
+    # it fails at every boot.
+    local irq_unit_enabled=0
+    if systemctl is-enabled --quiet affinity-manager-irq.service 2>/dev/null; then
+        irq_unit_enabled=1
+    fi
+
+    local found=0
+    if [[ -f "$pid1_conf" || -f "$qemu_conf" || -f "$machine_conf" ]]; then found=1; fi
+    if (( grub_ours || irq_unit_enabled )); then found=1; fi
+
+    if (( found == 0 )); then
+        if [[ -n "$cur_iso" || -n "$cur_nohz" || -n "$cur_rcu" ]]; then
+            warn "  GRUB carries isolation params not set by this script (${cur_iso:-no isolcpus}); leaving $GRUB_FILE alone."
+        fi
+        if (( have_slice_props )); then
+            log "  Slice AllowedCPUs drop-ins exist under system.control/ but nothing ties them to this script; leaving them alone (reset manually with: systemctl set-property <unit> AllowedCPUs=\"\")."
+        fi
+        log "  No previously applied host core reservation detected; nothing to remove."
+        apply_host_tuning
+        return 0
+    fi
+
+    log "  Found host core reservation from a previous run; removing it."
+
+    # New GRUB line with this script's three isolation params stripped
+    # (computed up front so the dry run can display it).
+    local updated_line=""
+    if (( grub_ours )); then
+        local param
+        updated_line="$grub_line"
+        for param in "$cur_iso" "$cur_nohz" "$cur_rcu"; do
+            if [[ -z "$param" ]]; then continue; fi
+            updated_line=${updated_line//"$param"/}
+        done
+        # Squeeze the gaps the removals left, respecting the quote style.
+        while [[ "$updated_line" == *"  "* ]]; do updated_line=${updated_line//  / }; done
+        updated_line=${updated_line/=\" /=\"}
+        updated_line=${updated_line/=\' /=\'}
+        updated_line=${updated_line/% \"/\"}
+        updated_line=${updated_line/% \'/\'}
+        while [[ "$updated_line" == *" " ]]; do updated_line=${updated_line% }; done
+    elif [[ -n "$cur_iso" ]]; then
+        warn "  GRUB isolcpus was not set by this script (${cur_iso}); leaving $GRUB_FILE alone."
+    fi
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        log "[DRY RUN] Host core reservation removal commands:"
+        echo ""
+        echo "  # Reset AllowedCPUs on slices"
+        echo "  systemctl set-property system.slice AllowedCPUs=\"\""
+        echo "  systemctl set-property user.slice AllowedCPUs=\"\""
+        echo "  systemctl set-property init.scope AllowedCPUs=\"\""
+        echo "  systemctl set-property --runtime qemu.slice AllowedCPUs=\"\""
+        echo ""
+        echo "  # Remove drop-ins (incl. the set-property persistence files, so"
+        echo "  # a later run does not mistake the reset itself for a leftover)"
+        echo "  rm -f $pid1_conf"
+        echo "  rm -f $qemu_conf $machine_conf"
+        echo "  rm -f ${SYSTEMD_ETC}/system.control/{system.slice.d,user.slice.d,init.scope.d}/50-AllowedCPUs.conf"
+        echo ""
+        if (( grub_ours )); then
+            echo "  # GRUB_CMDLINE_LINUX_DEFAULT without the isolation params (then update-grub + reboot):"
+            echo "  $updated_line"
+            echo ""
+        fi
+        echo "  # Reload systemd"
+        echo "  systemctl daemon-reexec"
+        if (( irq_unit_enabled )); then
+            echo ""
+            echo "  # The boot-time IRQ unit requires a reservation; disable it"
+            echo "  systemctl disable affinity-manager-irq.service"
+        fi
+        echo ""
+    else
+        log "Removing host core reservation..."
+
+        log "  Resetting AllowedCPUs on system.slice, user.slice, init.scope..."
+        systemctl set-property system.slice AllowedCPUs=""
+        systemctl set-property user.slice AllowedCPUs=""
+        systemctl set-property init.scope AllowedCPUs=""
+        # set-property RECORDS the empty reset as a system.control drop-in (it
+        # never deletes its persistence file) -- remove those too, or the reset
+        # itself lingers as a phantom "AllowedCPUs is configured" state.
+        for unit in system.slice user.slice init.scope; do
+            rm -f "${SYSTEMD_ETC}/system.control/${unit}.d/50-AllowedCPUs.conf"
+        done
+
+        local f
+        for f in "$pid1_conf" "$qemu_conf" "$machine_conf"; do
+            if [[ -f "$f" ]]; then
+                log "  Removing $f..."
+                rm -f "$f"
+            fi
+        done
+
+        if (( grub_ours )); then
+            log "  Removing isolation params from $GRUB_FILE..."
+            cp "$GRUB_FILE" "${GRUB_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+            local sed_replacement=${updated_line//\\/\\\\}
+            sed_replacement=${sed_replacement//&/\\&}
+            sed_replacement=${sed_replacement//|/\\|}
+            sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|${sed_replacement}|" "$GRUB_FILE"
+            log "  Run 'update-grub' and reboot to give the isolated cores back to the scheduler."
+        fi
+
+        log "  Reloading systemd (daemon-reexec)..."
+        systemctl daemon-reexec
+
+        # A stale --runtime cpuset (from an apply that ran while VMs were up)
+        # lives under /run and would re-restrict the slice until reboot; reset
+        # it regardless of the slice's current activity.
+        log "  Releasing the runtime qemu.slice AllowedCPUs restriction..."
+        systemctl set-property --runtime qemu.slice AllowedCPUs="" 2>/dev/null \
+            || warn "  Could not reset the runtime qemu.slice AllowedCPUs (slice not loadable?)."
+
+        if (( irq_unit_enabled )); then
+            log "  Disabling affinity-manager-irq.service (it requires a host core reservation)..."
+            systemctl disable affinity-manager-irq.service
+        fi
+
+        log "Host core reservation removed."
+        log "  Note: host processes already running keep their old CPU affinity until restarted; a reboot clears everything."
+    fi
+
+    release_device_irqs
+    apply_host_tuning
 }
 
 # --- OPT-IN HOST TUNING (tuning_settings) ---
@@ -2316,8 +2654,13 @@ create_state_file
 log "Planning Complete."
 
 # The plan validates -- only now is it safe to start mutating the host.
-log "--- PHASE 3.5: Applying Host Core Pinning ---"
-apply_host_pinning
+if [[ "$RESERVE_HOST_CORES" == "true" && ${#CORES_TO_RESERVE[@]} -gt 0 ]]; then
+    log "--- PHASE 3.5: Applying Host Core Pinning ---"
+    apply_host_pinning
+else
+    log "--- PHASE 3.5: Host Core Reservation Disabled ---"
+    remove_host_pinning
+fi
 install_hook_file
 install_irq_service
 
@@ -2369,6 +2712,24 @@ post_run_checks() {
                 log "  GRUB: isolation params match the booted kernel -- no reboot needed."
             fi
         fi
+    elif [[ "$RESERVE_HOST_CORES" != "true" ]]; then
+        # Removal case: the reservation is gone from the config, but the booted
+        # kernel (or an un-updated GRUB file) may still isolate the VM cores.
+        local rm_grub_line rm_grub_iso rm_booted rm_booted_iso
+        rm_grub_line=$(grep -m1 '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_FILE" 2>/dev/null || true)
+        rm_grub_iso=$(echo "$rm_grub_line" | grep -oP "isolcpus=[^\s\"']+" | head -n1 || true)
+        rm_booted=$(cat "$PROC_CMDLINE_FILE" 2>/dev/null || true)
+        rm_booted_iso=$(echo "$rm_booted" | grep -oP "isolcpus=[^\s\"']+" | head -n1 || true)
+        if [[ "$rm_grub_iso" == isolcpus=managed_irq,domain,* ]]; then
+            warn "  GRUB: $GRUB_FILE still carries this script's isolation params ($rm_grub_iso)$([ $DRY_RUN -eq 1 ] && echo ' (dry run did not remove them)')."
+            issues=1
+        elif [[ "$rm_booted_iso" == isolcpus=managed_irq,domain,* ]]; then
+            warn "  REBOOT REQUIRED: the booted kernel still isolates cores ($rm_booted_iso) although reservation is disabled."
+            warn "    Run 'update-grub' and reboot to give them back to the scheduler."
+            issues=1
+        else
+            log "  GRUB: no isolation params from this script -- nothing pending."
+        fi
     fi
 
     # 2) Boot-time IRQ re-confinement (/proc/irq does not survive reboots).
@@ -2380,6 +2741,10 @@ post_run_checks() {
             warn "    Set it up with: $0 -f $CONFIG_FILE --install-irq-service"
             issues=1
         fi
+    elif systemctl is-enabled --quiet affinity-manager-irq.service 2>/dev/null; then
+        warn "  IRQ persistence: affinity-manager-irq.service is still enabled, but it requires a host core reservation and will fail at boot."
+        warn "    Disable it with: systemctl disable affinity-manager-irq.service (a non-dry-run removal does this automatically)."
+        issues=1
     fi
 
     # 3) Hookscript coverage (per-vCPU 1:1 pinning + helper-thread spread).
