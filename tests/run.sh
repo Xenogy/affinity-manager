@@ -764,6 +764,197 @@ assert_grep "$WORK/fake-cpufreq/cpu5/cpufreq/scaling_governor" "^performance$" "
 assert_grep "$WORK/run.log" "cpufreq governor 'performance' set on 14/14 VM core\(s\)" "all VM cores covered"
 
 # =============================================================================
+scenario "reservation disabled: every core goes to VMs, clean host is a no-op"
+cat > "$WORK/config.json" <<'EOF'
+{
+  "global_settings": { "reserve_host_cores": false, "parallel_jobs": 2 },
+  "vms": { "101": 8, "102": 8 }
+}
+EOF
+run_manager -f "$WORK/config.json" -n -g
+
+assert_exit_code 0 "$RUN_RC" "exits 0"
+assert_grep "$WORK/run.log" "Host core reservation disabled \(reserve_host_cores is not true\)" "disabled reservation announced"
+# All 16 CPUs (incl. would-be host cores 0 and 8) are handed to the two VMs.
+assert_grep "$WORK/run.log" "\[DRY RUN\] Set Affinity: 0,1,2,3,8,9,10,11 \(Node 0\)" "first VM gets the whole of node 0 incl. cpu 0"
+assert_grep "$WORK/run.log" "\[DRY RUN\] Set Affinity: 4,5,6,7,12,13,14,15 \(Node 1\)" "second VM gets the whole of node 1"
+# Nothing to remove on a host that never had a reservation applied.
+assert_grep "$WORK/run.log" "No previously applied host core reservation detected" "clean host detected"
+assert_not_grep "$WORK/systemctl-calls.log" "set-property" "no slice is touched"
+assert_grep "$WORK/run.log" "GRUB: no isolation params from this script" "post-run check green for no-reserve"
+
+# --no-reserve overrides reserve_host_cores=true in the config the same way.
+write_basic_config
+run_manager -f "$WORK/config.json" -n -g --no-reserve
+assert_exit_code 0 "$RUN_RC" "--no-reserve run exits 0"
+assert_grep "$WORK/run.log" "Host core reservation disabled \(--no-reserve\)" "flag override announced"
+assert_grep "$WORK/run.log" "\[DRY RUN\] Set Affinity: 0,1 \(Node 0\)" "config host_cores are ignored under --no-reserve"
+
+# =============================================================================
+scenario "--no-reserve removes a previously applied reservation"
+cat > "$WORK/config.json" <<EOF
+{
+  "global_settings": {
+    "reserve_host_cores": true,
+    "host_cores": [0, 8],
+    "parallel_jobs": 2,
+    "state_file": "$WORK/state.json"
+  },
+  "disk_settings": { "storage_node_map": { "local-lvm": "node:0" } },
+  "vms": { "101": 2, "102": 2, "103": 2, "104": 2 }
+}
+EOF
+export QM_FIXTURE_DIR="$FIXTURES/qm-mem"
+export GRUB_FILE="$WORK/grub"
+export SYSTEMD_ETC="$WORK/sysd"
+printf 'GRUB_CMDLINE_LINUX_DEFAULT="quiet"\n' > "$GRUB_FILE"
+make_node_hugepages 0 8
+make_node_hugepages 1 8
+make_irq 50 eth0 "0-15"
+
+# 1) Apply the reservation for real.
+run_manager -f "$WORK/config.json" -g
+assert_exit_code 0 "$RUN_RC" "reserving apply exits 0"
+assert_file_exists "$SYSTEMD_ETC/system.conf.d/99-host-cores.conf" "PID1 drop-in applied"
+assert_grep "$IRQ_PROC_BASE/50/smp_affinity_list" "^0,8$" "IRQ confined to host cores"
+
+# 2) Remove it with --no-reserve; the booted kernel still carries the params.
+# The call log is truncated so every systemctl assertion below pins THIS run,
+# not leftovers of the reserving apply above.
+printf 'BOOT_IMAGE=/boot/vmlinuz quiet isolcpus=managed_irq,domain,1-7,9-15 nohz_full=1-7,9-15 rcu_nocbs=1-7,9-15\n' > "$PROC_CMDLINE_FILE"
+: > "$WORK/systemctl-calls.log"
+# set-property persistence file (as real systemd would have written it) must
+# be cleaned up, or the reset itself reads as a leftover on the next run.
+mkdir -p "$SYSTEMD_ETC/system.control/system.slice.d"
+printf '[Slice]\nAllowedCPUs=0 8\n' > "$SYSTEMD_ETC/system.control/system.slice.d/50-AllowedCPUs.conf"
+# An IRQ the admin pinned AFTER the apply (mask not confined to the ex-host
+# cores) is not this script's and must survive the removal untouched.
+make_irq 51 mlx0 "2"
+run_manager -f "$WORK/config.json" -g --no-reserve
+assert_exit_code 0 "$RUN_RC" "removal run exits 0"
+assert_grep "$WORK/run.log" "Found host core reservation from a previous run" "leftovers detected"
+assert_file_absent "$SYSTEMD_ETC/system.conf.d/99-host-cores.conf" "PID1 drop-in removed"
+assert_file_absent "$SYSTEMD_ETC/system/qemu.slice.d/99-vm-cores.conf" "qemu.slice drop-in removed"
+assert_file_absent "$SYSTEMD_ETC/system.control/system.slice.d/50-AllowedCPUs.conf" "set-property persistence file cleaned up"
+assert_grep "$WORK/grub" '^GRUB_CMDLINE_LINUX_DEFAULT="quiet"$' "GRUB isolation params stripped cleanly"
+assert_grep "$WORK/systemctl-calls.log" "^systemctl set-property system.slice AllowedCPUs=$" "system.slice cpuset reset"
+assert_grep "$WORK/systemctl-calls.log" "^systemctl set-property user.slice AllowedCPUs=$" "user.slice cpuset reset"
+assert_grep "$WORK/systemctl-calls.log" "^systemctl set-property init.scope AllowedCPUs=$" "init.scope cpuset reset"
+assert_grep "$WORK/systemctl-calls.log" "^systemctl set-property --runtime qemu.slice AllowedCPUs=$" "runtime qemu.slice cpuset released"
+assert_grep "$WORK/systemctl-calls.log" "^systemctl daemon-reexec$" "systemd reloaded after removal"
+assert_grep "$IRQ_PROC_BASE/50/smp_affinity_list" "^0-15$" "confined IRQ widened back to all CPUs"
+assert_grep "$IRQ_PROC_BASE/51/smp_affinity_list" "^2$" "admin-pinned IRQ (not on ex-host cores) left untouched"
+# The ex-host cores are planned and applied to VMs again.
+assert_grep "$WORK/qm-calls.log" "^qm set 104 -cores 2 -cpu host -affinity 0,1$" "ex-host core 0 assigned to a VM"
+assert_json "$WORK/state.json" '.metadata.applied == true' "state marked applied after removal run"
+# Removal is not live until reboot: the booted cmdline still isolates cores.
+assert_grep "$WORK/run.log" "REBOOT REQUIRED: the booted kernel still isolates cores" "reboot requirement flagged after removal"
+
+# 3) Idempotence, via the config instead of the flag: nothing left to remove.
+jq '.global_settings.reserve_host_cores = false' "$WORK/config.json" > "$WORK/config.json.tmp"
+mv "$WORK/config.json.tmp" "$WORK/config.json"
+run_manager -f "$WORK/config.json" -g
+assert_exit_code 0 "$RUN_RC" "second removal run exits 0"
+assert_grep "$WORK/run.log" "No previously applied host core reservation detected" "removal is idempotent"
+assert_grep "$WORK/grub" '^GRUB_CMDLINE_LINUX_DEFAULT="quiet"$' "GRUB stays clean"
+
+# 4) An enabled boot-time IRQ unit is itself a leftover and gets disabled.
+export SYSTEMCTL_IS_ENABLED_RC=0
+run_manager -f "$WORK/config.json" -g
+assert_exit_code 0 "$RUN_RC" "unit-disable run exits 0"
+assert_grep "$WORK/systemctl-calls.log" "^systemctl disable affinity-manager-irq.service$" "boot-time IRQ unit disabled"
+unset SYSTEMCTL_IS_ENABLED_RC
+
+# =============================================================================
+scenario "dry-run removal plans everything, touches nothing, spares foreign isolcpus"
+write_basic_config
+export QM_FIXTURE_DIR="$FIXTURES/qm-mem"
+mkdir -p "$SYSTEMD_ETC/system.conf.d" "$SYSTEMD_ETC/system/qemu.slice.d"
+printf '[Manager]\nCPUAffinity=0 8\n' > "$SYSTEMD_ETC/system.conf.d/99-host-cores.conf"
+printf '[Slice]\nAllowedCPUs=1-7,9-15\n' > "$SYSTEMD_ETC/system/qemu.slice.d/99-vm-cores.conf"
+printf 'GRUB_CMDLINE_LINUX_DEFAULT="quiet isolcpus=managed_irq,domain,1-7,9-15 nohz_full=1-7,9-15 rcu_nocbs=1-7,9-15"\n' > "$GRUB_FILE"
+make_irq 60 eth0 "0,8"
+make_irq 61 mlx0 "3"
+run_manager -f "$WORK/config.json" -n -g --no-reserve
+
+assert_exit_code 0 "$RUN_RC" "dry-run removal exits 0"
+assert_grep "$WORK/run.log" "\[DRY RUN\] Host core reservation removal commands" "removal plan printed"
+assert_grep "$WORK/run.log" 'GRUB_CMDLINE_LINUX_DEFAULT="quiet"$' "plan shows the stripped GRUB line"
+assert_grep "$WORK/run.log" "\[plan\] IRQ 60 \(eth0\): 0,8 -> 0-15" "IRQ widening planned"
+assert_not_grep "$WORK/run.log" "\[plan\] IRQ 61" "IRQ not on ex-host cores is not planned for widening"
+assert_grep "$WORK/run.log" "1 not confined to ex-host cores \(left as-is\)" "summary counts the spared IRQ"
+assert_file_exists "$SYSTEMD_ETC/system.conf.d/99-host-cores.conf" "dry run removes no drop-in"
+assert_grep "$GRUB_FILE" "isolcpus=managed_irq,domain,1-7,9-15" "dry run leaves GRUB alone"
+assert_grep "$IRQ_PROC_BASE/60/smp_affinity_list" "^0,8$" "dry run leaves IRQ affinity alone"
+assert_not_grep "$WORK/systemctl-calls.log" "set-property" "dry run resets no slice"
+assert_grep "$WORK/run.log" "still carries this script's isolation params.*\(dry run did not remove them\)" "post-run check flags unremoved GRUB params"
+
+# A foreign isolcpus (not this script's signature) is never stripped.
+printf 'GRUB_CMDLINE_LINUX_DEFAULT="quiet isolcpus=domain,5-9"\n' > "$GRUB_FILE"
+run_manager -f "$WORK/config.json" -g --no-reserve
+assert_exit_code 0 "$RUN_RC" "foreign-isolcpus removal exits 0"
+assert_grep "$WORK/run.log" "GRUB isolcpus was not set by this script \(isolcpus=domain,5-9\)" "foreign isolcpus warned about"
+assert_grep "$GRUB_FILE" '^GRUB_CMDLINE_LINUX_DEFAULT="quiet isolcpus=domain,5-9"$' "foreign isolcpus left in place"
+assert_file_absent "$SYSTEMD_ETC/system.conf.d/99-host-cores.conf" "this script's drop-ins still removed"
+
+# The GRUB signature alone is enough evidence (drop-ins already hand-removed),
+# and removal respects a single-quoted GRUB_CMDLINE_LINUX_DEFAULT.
+printf "GRUB_CMDLINE_LINUX_DEFAULT='quiet splash isolcpus=managed_irq,domain,1-7,9-15 nohz_full=1-7,9-15 rcu_nocbs=1-7,9-15'\n" > "$GRUB_FILE"
+run_manager -f "$WORK/config.json" -g --no-reserve
+assert_exit_code 0 "$RUN_RC" "grub-only removal exits 0"
+assert_grep "$WORK/run.log" "Found host core reservation from a previous run" "GRUB signature alone triggers removal"
+assert_grep "$GRUB_FILE" "^GRUB_CMDLINE_LINUX_DEFAULT='quiet splash'$" "single-quoted line stripped cleanly, no stray quote"
+
+# A system.control AllowedCPUs drop-in ALONE (any tool's set-property writes
+# one) is NOT evidence of this script; it is reported but never touched.
+mkdir -p "$SYSTEMD_ETC/system.control/system.slice.d"
+printf '[Slice]\nAllowedCPUs=0-3\n' > "$SYSTEMD_ETC/system.control/system.slice.d/50-AllowedCPUs.conf"
+: > "$WORK/systemctl-calls.log"
+run_manager -f "$WORK/config.json" -g --no-reserve
+assert_exit_code 0 "$RUN_RC" "slice-props-only run exits 0"
+assert_grep "$WORK/run.log" "nothing ties them to this script; leaving them alone" "foreign slice properties reported, not removed"
+assert_grep "$WORK/run.log" "No previously applied host core reservation detected" "no removal triggered by foreign slice properties"
+assert_file_exists "$SYSTEMD_ETC/system.control/system.slice.d/50-AllowedCPUs.conf" "foreign slice property file untouched"
+assert_not_grep "$WORK/systemctl-calls.log" "set-property" "no slice reset for foreign properties"
+
+# =============================================================================
+scenario "contradictory reservation options are rejected up front"
+write_basic_config
+run_manager -f "$WORK/config.json" -n -g -a 1 --no-reserve
+assert_exit_code 1 "$RUN_RC" "--no-reserve with -a exits 1"
+assert_grep "$WORK/run.log" "\-\-no-reserve cannot be combined with -a/-b" "conflict named"
+assert_not_grep "$WORK/run.log" "PHASE 1" "rejected before any phase runs"
+
+run_manager -f "$WORK/config.json" -i --no-reserve
+assert_exit_code 1 "$RUN_RC" "--no-reserve with -i exits 1"
+assert_grep "$WORK/run.log" "\-\-no-reserve cannot be combined with -i" "conflict named"
+
+cat > "$WORK/config.json" <<'EOF'
+{
+  "global_settings": { "reserve_host_cores": false },
+  "vms": { "101": 2 }
+}
+EOF
+run_manager -f "$WORK/config.json" -n -g -a 1
+assert_exit_code 1 "$RUN_RC" "-a with reservation disabled exits 1"
+assert_grep "$WORK/run.log" "auto-select host cores to reserve, but global_settings.reserve_host_cores is not true" "-a/-b require reservation"
+
+run_manager -f "$WORK/config.json" -n -g --install-irq-service
+assert_exit_code 0 "$RUN_RC" "--install-irq-service with reservation disabled still runs"
+assert_grep "$WORK/run.log" "\-\-install-irq-service is ignored: host core reservation is disabled" "boot unit install skipped with a warning"
+assert_not_grep "$WORK/run.log" "Would write .*affinity-manager-irq" "unit install really skipped, not just warned about"
+
+cat > "$WORK/config.json" <<'EOF'
+{
+  "global_settings": { "reserve_host_cores": "ture", "host_cores": [0, 8] },
+  "vms": { "101": 2 }
+}
+EOF
+run_manager -f "$WORK/config.json" -n -g
+assert_exit_code 1 "$RUN_RC" "typo'd reserve_host_cores exits 1"
+assert_grep "$WORK/run.log" "reserve_host_cores must be true or false \(got 'ture'\)" "typo rejected instead of silently unreserving"
+
+# =============================================================================
 echo ""
 echo "================================================="
 echo "  $PASS passed, $FAIL failed"

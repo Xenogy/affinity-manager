@@ -50,9 +50,33 @@ attached. These are warnings only; they never change the exit code.
 | `-i` | Only re-apply device IRQ confinement, then exit (see persistence below). |
 | `-s <volume-id>` | Attach a hook script to each VM (a snippets volume ID, e.g. `local:snippets/vcpu-pin-hook.sh`). |
 | `-r` | Print the commands to undo host core pinning. |
+| `--no-reserve` | Run without host core reservation (overrides `reserve_host_cores`) and remove a previously applied reservation. See below. |
 | `-h` | Show usage and exit. |
 
 `-a` and `-b` write the cores they pick back into the config (a timestamped backup is made first).
+
+### Running without host core reservation
+
+On small hosts it can make sense to give **every** thread to the VMs — e.g. 8 threads
+total with two 4-thread VMs — and let the host services share the cores instead of
+reserving any. Set `"reserve_host_cores": false` in the config (or pass `--no-reserve`
+to override a config that says `true`): the planner then treats all CPUs as available
+and the VMs still get NUMA-aware, non-overlapping affinity sets.
+
+A previous *reserving* run's leftovers would actively fight such a plan (a stale
+`qemu.slice` `AllowedCPUs=` keeps VMs off the ex-host cores), so a run with
+reservation disabled also **removes** them: the slice cpusets are reset, the
+`99-host-cores.conf` / `99-vm-cores.conf` drop-ins deleted, the
+`isolcpus`/`nohz_full`/`rcu_nocbs` GRUB params stripped (only when they carry this
+script's `isolcpus=managed_irq,domain,…` signature — a foreign `isolcpus` is left
+alone with a warning), device IRQs whose affinity was confined to the former host
+cores are widened back to all CPUs (any other IRQ placement is presumed deliberate
+and untouched), and an enabled `affinity-manager-irq.service` is disabled (it
+requires a reservation).
+The removal is evidence-based and idempotent: a host that never had a reservation
+applied is a no-op, and dry runs (`-n`) only print the commands. As with applying
+the params, removing them from GRUB needs `update-grub` and a **reboot** to take
+effect — the post-run checks flag this until the booted kernel is clean.
 
 ## Configuration
 
@@ -86,6 +110,8 @@ attached. These are warnings only; they never change the exit code.
 **global_settings**
 - `cpu_config_string` — CPU type and flags passed to the VMs.
 - `reserve_host_cores` — keep `host_cores` for the host and pin VMs off them.
+  Set to `false` to hand every core to the VMs *and* remove a previously applied
+  reservation (see "Running without host core reservation" above).
 - `host_cores` — CPU IDs reserved for the host (or leave it and use `-a`/`-b`).
   Entries are validated against the actual topology.
 - `state_file` — where the plan record is written (default `manager_state.json`).
@@ -201,6 +227,9 @@ sudo ./manager.sh -f config.json -b 2
 
 # CPU-only, no GPU assignment
 sudo ./manager.sh -f config.json -g
+
+# Hand ALL cores to the VMs and remove any existing host core reservation
+sudo ./manager.sh -f config.json --no-reserve
 
 # Re-apply IRQ confinement after a NIC reset
 sudo ./manager.sh -f config.json -i
