@@ -144,7 +144,9 @@ usage() {
     echo "  -n:                    Dry run mode. Plan changes but do not execute them. Optional."
     echo "  -s <hook_script_path>: Path to hook script for VM isolation. Optional."
     echo "  -r:                    Show commands to reset host core pinning. Optional."
-    echo "  -a [N]:                Auto-select host cores, consolidated on least GPU-loaded NUMA node. Optional."
+    echo "  -a [N]:                Auto-select host cores, consolidated on one NUMA node: a node excluded"
+    echo "                         by numa_settings.vm_nodes if set, else the smallest-memory node on"
+    echo "                         memory-asymmetric hosts, else the least GPU-loaded node. Optional."
     echo "  -b [N]:                Auto-select host cores, balanced across physical sockets (N phys + N SMT per socket). Optional."
     echo "  -g:                    Skip GPU discovery and assignment (force CPU-only). Optional."
     echo "  -i:                    Only re-apply device IRQ confinement, then exit. Optional."
@@ -334,6 +336,28 @@ socket_to_node() {
     done
 
     return 1
+}
+
+# socket_to_all_nodes <socket>: every NUMA node with CPUs on that socket, one
+# per line. socket_to_node above returns only the FIRST node -- fine for a
+# soft disk-locality hint, wrong for anything used as a hard constraint on
+# hosts where one socket spans several nodes (EPYC NPS-2/4, Intel SNC).
+socket_to_all_nodes() {
+    local socket_id=$1
+    local cpu_id found=0
+    local -A seen_nodes=()
+
+    for cpu_id in $(seq 0 "$SMT_END"); do
+        if [[ -v CPU_TO_SOCKET["$cpu_id"] && "${CPU_TO_SOCKET[$cpu_id]}" == "$socket_id" ]]; then
+            if [[ ! -v seen_nodes["${CPU_TO_NODE[$cpu_id]}"] ]]; then
+                seen_nodes["${CPU_TO_NODE[$cpu_id]}"]=1
+                echo "${CPU_TO_NODE[$cpu_id]}"
+                found=1
+            fi
+        fi
+    done
+
+    (( found == 1 ))
 }
 
 resolve_locality_value_to_node() {
@@ -831,6 +855,148 @@ SMT_END=$MAX_CPU_ID
 
 log "  CPUs: ${#ALL_PHYS_CPUS[@]} physical core(s), ${#ALL_SMT_CPUS[@]} SMT thread(s), max CPU id $MAX_CPU_ID"
 
+# --- Per-node memory & 1G hugepage pool discovery (+ numa_settings) ---------
+# On hosts with asymmetric per-node RAM (e.g. a small DIMM pair for the host
+# on node 0 and big DIMMs for the VMs on node 1), balancing VMs by free cores
+# alone binds them to nodes whose memory cannot hold them. Capacity per node
+# is therefore tracked in 1G-page units: the sysfs hugepage pool when one is
+# configured (authoritative), else estimated from the node's MemTotal.
+declare -A NODE_MEM_TOTAL_MB=() NODE_1G_HUGEPAGES_TOTAL=() NODE_1G_HUGEPAGES_PLANNED=() NODE_1G_HUGEPAGES_FREE=()
+declare -A VM_NODE_ALLOWLIST=() NODE_HAS_HOST_CORES=()
+
+HUGEPAGE_NODE_SAFETY_PAGES=$(jq -r '.global_settings.hugepage_node_safety_pages // 2' "$CONFIG_FILE")
+if [[ ! "$HUGEPAGE_NODE_SAFETY_PAGES" =~ ^[0-9]+$ ]]; then
+    HUGEPAGE_NODE_SAFETY_PAGES=2
+fi
+
+# Memory kept out of the VM-capacity estimate on nodes where the host itself
+# lives (the reserved-host-core node(s), or every node when reservation is
+# off). Only used when a node has no hugepage pool yet -- an existing pool
+# already excludes host memory by construction.
+HOST_MEMORY_RESERVE_MB=$(jq -r '.numa_settings.host_memory_reserve_mb // 2048' "$CONFIG_FILE")
+if [[ ! "$HOST_MEMORY_RESERVE_MB" =~ ^[0-9]+$ ]]; then
+    error "numa_settings.host_memory_reserve_mb must be a non-negative integer (got '$HOST_MEMORY_RESERVE_MB')."
+fi
+
+for node_id in "${NUMA_NODE_IDS[@]}"; do
+    hp_dir="${NODE_SYS_BASE}/node${node_id}/hugepages/hugepages-1048576kB"
+    NODE_1G_HUGEPAGES_PLANNED["$node_id"]=0
+    NODE_1G_HUGEPAGES_TOTAL["$node_id"]=-1
+    NODE_1G_HUGEPAGES_FREE["$node_id"]=-1
+    if [[ -f "$hp_dir/nr_hugepages" ]]; then
+        hp_total=$(cat "$hp_dir/nr_hugepages" 2>/dev/null || echo "-1")
+        if [[ "$hp_total" =~ ^[0-9]+$ ]]; then
+            NODE_1G_HUGEPAGES_TOTAL["$node_id"]=$hp_total
+        fi
+    fi
+    # Free pages matter too: nr_hugepages counts pages already consumed by
+    # running VMs (including ones outside this config), which the planner
+    # cannot reclaim.
+    if [[ -f "$hp_dir/free_hugepages" ]]; then
+        hp_free=$(cat "$hp_dir/free_hugepages" 2>/dev/null || echo "-1")
+        if [[ "$hp_free" =~ ^[0-9]+$ ]]; then
+            NODE_1G_HUGEPAGES_FREE["$node_id"]=$hp_free
+        fi
+    fi
+    node_meminfo="${NODE_SYS_BASE}/node${node_id}/meminfo"
+    if [[ -f "$node_meminfo" ]]; then
+        node_mem_kb=$(awk '/MemTotal:/ {print $(NF-1); exit}' "$node_meminfo" 2>/dev/null || true)
+        if [[ "$node_mem_kb" =~ ^[0-9]+$ ]]; then
+            NODE_MEM_TOTAL_MB["$node_id"]=$(( node_mem_kb / 1024 ))
+        fi
+    fi
+    _mem_str="unknown"
+    if [[ -v NODE_MEM_TOTAL_MB["$node_id"] ]]; then _mem_str="${NODE_MEM_TOTAL_MB[$node_id]} MB"; fi
+    _pool_str="none"
+    if (( ${NODE_1G_HUGEPAGES_TOTAL[$node_id]} >= 0 )); then
+        _pool_str="${NODE_1G_HUGEPAGES_TOTAL[$node_id]} page(s), ${NODE_1G_HUGEPAGES_FREE[$node_id]} free"
+    fi
+    log "  Node $node_id: memory ${_mem_str}, 1G hugepage pool: ${_pool_str}"
+done
+unset hp_dir hp_total hp_free node_meminfo node_mem_kb _mem_str _pool_str
+
+# On any 1G-capable kernel the nr_hugepages file always exists and reads 0
+# until someone allocates pages -- that is "not configured yet", NOT "a pool
+# of zero". But once ANY node has an allocated pool, the admin has sized the
+# pools deliberately and a 0 on another node is a hard "no VM memory here".
+HOST_HAS_ANY_1G_POOL=0
+for node_id in "${NUMA_NODE_IDS[@]}"; do
+    if (( ${NODE_1G_HUGEPAGES_TOTAL[$node_id]} > 0 )); then HOST_HAS_ANY_1G_POOL=1; fi
+done
+
+# Optional hard allowlist of NUMA nodes VMs may be placed on
+# (numa_settings.vm_nodes): a node id, "node:N", or "socket:N" (a socket entry
+# expands to EVERY node of that socket). Unlike the soft disk-locality hints,
+# every entry is validated against this host's topology -- a hard allowlist
+# built from a config copied off another machine must fail here, not surface
+# later as "no NUMA node has enough free cores". Absent = all nodes allowed.
+_vn_type=$(jq -r '.numa_settings as $n | if ($n|type)=="object" and ($n|has("vm_nodes")) then ($n.vm_nodes|type) else "absent" end' "$CONFIG_FILE")
+if [[ "$_vn_type" != "absent" ]]; then
+    if [[ "$_vn_type" != "array" ]]; then
+        error "numa_settings.vm_nodes must be an array of node values (got JSON type '$_vn_type')."
+    fi
+    while IFS= read -r _vn; do
+        _vn_nodes=""
+        if [[ "$_vn" =~ ^(node:)?([0-9]+)$ ]]; then
+            # Capture both groups now: the membership [[ =~ ]] below clobbers
+            # BASH_REMATCH (and an unmatched optional group is unset under -u).
+            _vn_prefix=${BASH_REMATCH[1]:-}
+            _vn_id=${BASH_REMATCH[2]}
+            if [[ " ${NUMA_NODE_IDS[*]} " =~ " ${_vn_id} " ]]; then
+                _vn_nodes=$_vn_id
+            elif [[ -z "$_vn_prefix" ]]; then
+                # A bare numeral that is not a node id may name a socket.
+                _vn_nodes=$(socket_to_all_nodes "$_vn_id" 2>/dev/null || true)
+            fi
+        elif [[ "$_vn" =~ ^socket:([0-9]+)$ ]]; then
+            _vn_nodes=$(socket_to_all_nodes "${BASH_REMATCH[1]}" 2>/dev/null || true)
+        fi
+        if [[ -z "$_vn_nodes" ]]; then
+            error "numa_settings.vm_nodes entry '$_vn' does not resolve to a NUMA node on this host (nodes: ${NUMA_NODE_IDS[*]})."
+        fi
+        for _vn_node in $_vn_nodes; do VM_NODE_ALLOWLIST["$_vn_node"]=1; done
+    done < <(jq -r '.numa_settings.vm_nodes[]' "$CONFIG_FILE")
+    if (( ${#VM_NODE_ALLOWLIST[@]} == 0 )); then
+        error "numa_settings.vm_nodes is present but empty; remove it or list at least one node."
+    fi
+    log "  VM placement restricted to NUMA node(s): $(printf '%s\n' "${!VM_NODE_ALLOWLIST[@]}" | sort -n | tr '\n' ' ')"
+    unset _vn _vn_node _vn_nodes _vn_id _vn_prefix
+fi
+unset _vn_type
+
+# node_allowed <node>: may VMs be placed on this node?
+node_allowed() {
+    (( ${#VM_NODE_ALLOWLIST[@]} == 0 )) || [[ -v VM_NODE_ALLOWLIST["$1"] ]]
+}
+
+# node_capacity_1g_pages <node>: the node's effective 1G-page capacity for VM
+# memory, echoed as "<pages>|<source>". Source "pool" = the allocated sysfs
+# hugepage pool (a 0-page pool counts only while some other node has an
+# allocated one -- see HOST_HAS_ANY_1G_POOL); "memtotal" = estimated from the
+# node's MemTotal minus the host memory reserve where the host lives; "none"
+# (pages -1) = unknown, the planner treats the node as unconstrained
+# (pre-memory-awareness behavior).
+node_capacity_1g_pages() {
+    local node_id=$1
+    local total_pages=${NODE_1G_HUGEPAGES_TOTAL[$node_id]:--1}
+    if (( total_pages > 0 || (total_pages == 0 && HOST_HAS_ANY_1G_POOL == 1) )); then
+        echo "${total_pages}|pool"
+        return 0
+    fi
+    local mem_mb=${NODE_MEM_TOTAL_MB[$node_id]:--1}
+    if (( mem_mb < 0 )); then
+        echo "-1|none"
+        return 0
+    fi
+    local reserve_mb=0
+    if [[ -v NODE_HAS_HOST_CORES["$node_id"] || "$RESERVE_HOST_CORES" != "true" ]]; then
+        reserve_mb=$HOST_MEMORY_RESERVE_MB
+    fi
+    local cap_mb=$(( mem_mb - reserve_mb ))
+    if (( cap_mb < 0 )); then cap_mb=0; fi
+    echo "$(( cap_mb / 1024 ))|memtotal"
+}
+
 # --- Auto-select host cores function (CONSOLIDATED TO ONE NODE) ---
 auto_select_host_cores() {
     local total_phys_to_reserve=$1
@@ -941,7 +1107,10 @@ if [[ $AUTO_HOST_CORES -eq 1 ]]; then
         while IFS= read -r _pci; do
             [[ -z "$_pci" ]] && continue
             _pci_node=$(cat "${PCI_SYS_BASE}/${_pci}/numa_node" 2>/dev/null || echo -1)
-            [[ "$_pci_node" == "-1" ]] && _pci_node=0
+            # A GPU without NUMA locality (-1, common on single-socket boards)
+            # says nothing about which node to avoid -- don't count it.
+            # (Previously it was coerced to node 0 and skewed the selection.)
+            if [[ ! "$_pci_node" =~ ^[0-9]+$ ]]; then continue; fi
             _prof=$(jq -r --arg p "$_pci" \
                 '.gpu_settings.gpu_profile_map[$p] // .gpu_settings.mdev_override // "nvidia-47"' \
                 "$CONFIG_FILE")
@@ -954,16 +1123,66 @@ if [[ $AUTO_HOST_CORES -eq 1 ]]; then
             _node_gpu_slots["$_pci_node"]=$(( ${_node_gpu_slots[$_pci_node]:-0} + _avail ))
         done <<< "$_pci_list"
         unset _pci_list
-        TARGET_NODE=${NUMA_NODE_IDS[0]}
-        _min_slots=${_node_gpu_slots[${NUMA_NODE_IDS[0]}]:-0}
-        for _nid in "${NUMA_NODE_IDS[@]}"; do
-            if (( ${_node_gpu_slots[$_nid]:-0} < _min_slots )); then
-                _min_slots=${_node_gpu_slots[$_nid]:-0}
-                TARGET_NODE=$_nid
+
+        # Candidate host nodes: nodes excluded from VM placement first (with
+        # numa_settings.vm_nodes the non-VM nodes are by definition where the
+        # host belongs), else every node.
+        _cand_nodes=()
+        if (( ${#VM_NODE_ALLOWLIST[@]} > 0 )); then
+            for _nid in "${NUMA_NODE_IDS[@]}"; do
+                if [[ ! -v VM_NODE_ALLOWLIST["$_nid"] ]]; then _cand_nodes+=("$_nid"); fi
+            done
+        fi
+        if (( ${#_cand_nodes[@]} > 0 )); then
+            log "  Host-core candidates restricted to non-VM node(s): ${_cand_nodes[*]} (numa_settings.vm_nodes)"
+        else
+            _cand_nodes=("${NUMA_NODE_IDS[@]}")
+        fi
+
+        # Per-candidate memory capacity (1G-page units). On hosts with clearly
+        # asymmetric per-node memory (>=2x), capacity outranks GPU load: the
+        # VMs must live where the RAM is, so the host belongs on the small
+        # node regardless of where the GPUs sit.
+        declare -A _node_cap
+        _mem_known=1; _min_cap=-1; _max_cap=-1
+        for _nid in "${_cand_nodes[@]}"; do
+            _cap=$(node_capacity_1g_pages "$_nid"); _cap=${_cap%%|*}
+            _node_cap["$_nid"]=$_cap
+            if (( _cap < 0 )); then _mem_known=0; continue; fi
+            if (( _min_cap < 0 || _cap < _min_cap )); then _min_cap=$_cap; fi
+            if (( _cap > _max_cap )); then _max_cap=$_cap; fi
+        done
+        _mem_primary=0
+        if (( _mem_known == 1 && _max_cap > _min_cap && _max_cap >= 2 * _min_cap )); then
+            _mem_primary=1
+        fi
+
+        TARGET_NODE=${_cand_nodes[0]}
+        for _nid in "${_cand_nodes[@]:1}"; do
+            _n_slots=${_node_gpu_slots[$_nid]:-0}
+            _b_slots=${_node_gpu_slots[$TARGET_NODE]:-0}
+            _n_cap=${_node_cap[$_nid]:--1}
+            _b_cap=${_node_cap[$TARGET_NODE]:--1}
+            if (( _mem_primary == 1 )); then
+                if (( _n_cap < _b_cap || (_n_cap == _b_cap && _n_slots < _b_slots) )); then
+                    TARGET_NODE=$_nid
+                fi
+            else
+                # Below the asymmetry threshold, capacity differences are
+                # DIMM-population noise: keep the pre-existing tie behavior
+                # (lowest node id) so unaffected hosts pick the same node.
+                if (( _n_slots < _b_slots )); then
+                    TARGET_NODE=$_nid
+                fi
             fi
         done
-        log "  Least GPU-loaded NUMA node: Node $TARGET_NODE (gpu_slots=${_min_slots})"
-        unset _node_gpu_slots _target_vram _pci _pci_node _prof _avail _mem _max_by_vram _min_slots _nid
+        if (( _mem_primary == 1 )); then
+            log "  Smallest-memory NUMA node: Node $TARGET_NODE (capacity=${_node_cap[$TARGET_NODE]}x1G; memory-asymmetric host, gpu_slots=${_node_gpu_slots[$TARGET_NODE]:-0})"
+        else
+            log "  Least GPU-loaded NUMA node: Node $TARGET_NODE (gpu_slots=${_node_gpu_slots[$TARGET_NODE]:-0})"
+        fi
+        unset _node_gpu_slots _node_cap _target_vram _pci _pci_node _prof _avail _mem _max_by_vram _nid \
+            _cand_nodes _mem_known _min_cap _max_cap _mem_primary _cap _n_slots _b_slots _n_cap _b_cap
 
         # Calculate total physical cores to reserve (e.g., -a 2 on a 2-node system = 4 total physical)
         TOTAL_PHYS_TO_RESERVE=$(( CORES_PER_NUMA * ${#NUMA_NODE_IDS[@]} ))
@@ -1335,6 +1554,20 @@ if [[ "$RESERVE_HOST_CORES" == "true" ]]; then
                 fi
             done
         done
+    fi
+
+    for core_id in "${CORES_TO_RESERVE[@]}"; do
+        NODE_HAS_HOST_CORES["${CPU_TO_NODE[$core_id]}"]=1
+    done
+    if (( ${#VM_NODE_ALLOWLIST[@]} > 0 )); then
+        _host_on_vm_nodes=()
+        for _hn in "${!NODE_HAS_HOST_CORES[@]}"; do
+            if [[ -v VM_NODE_ALLOWLIST["$_hn"] ]]; then _host_on_vm_nodes+=("$_hn"); fi
+        done
+        if (( ${#_host_on_vm_nodes[@]} > 0 )); then
+            warn "Host cores are reserved on VM node(s) ${_host_on_vm_nodes[*]} (numa_settings.vm_nodes) -- the host will compete with VMs for that node's memory bandwidth."
+        fi
+        unset _host_on_vm_nodes _hn
     fi
 
     if [[ ${#CORES_TO_RESERVE[@]} -gt 0 && $CONFINE_IRQS_ONLY -eq 0 ]]; then
@@ -1844,6 +2077,18 @@ for cpu_id in $(seq 0 "$SMT_END"); do
         fi
     fi
 done
+# Nodes excluded by numa_settings.vm_nodes contribute no VM cores: clearing
+# them here keeps every downstream consumer (SMT ratio, pre-flight, node
+# scans) consistent without scattering allowlist checks. The cores themselves
+# stay in qemu.slice for unmanaged VMs.
+if (( ${#VM_NODE_ALLOWLIST[@]} > 0 )); then
+    for node_id in "${NUMA_NODE_IDS[@]}"; do
+        if node_allowed "$node_id"; then continue; fi
+        AVAILABLE_PHYS_CORES["$node_id"]=""
+        AVAILABLE_SMT_CORES["$node_id"]=""
+        log "  Node $node_id: excluded from VM placement (numa_settings.vm_nodes)."
+    done
+fi
 
 
 # =============================================================================
@@ -1869,11 +2114,15 @@ discover_one_gpu() {
     local auto_detect=$4
     local manual_mdev=$5
 
+    # numa_node -1 (or a missing file) means the platform does not report the
+    # GPU's NUMA locality -- common on single-socket boards. Keep it as -1
+    # ("unknown") instead of assuming node 0: the planner then places the VM
+    # by memory/core fit and attaches the vGPU from wherever it is.
     local numa_path="${PCI_SYS_BASE}/${pci_slot}/numa_node"
-    local numa_node="0"
+    local numa_node="-1"
     if [[ -f "$numa_path" ]]; then
         val=$(cat "$numa_path")
-        if [[ "$val" != "-1" ]]; then numa_node=$val; fi
+        if [[ "$val" =~ ^[0-9]+$ ]]; then numa_node=$val; fi
     fi
 
     local mdev_base="${PCI_SYS_BASE}/${pci_slot}/mdev_supported_types"
@@ -1927,7 +2176,9 @@ discover_one_gpu() {
             local slot_cap=$available_instances
             if (( vram_slot_cap > 0 )); then slot_cap=$vram_slot_cap; fi
             printf '%s|%s|%s|%s|%s\n' "$pci_slot" "$numa_node" "$selected_type" "$available_instances" "$slot_cap" > "$datfile"
-            log "  Registered GPU $pci_slot: Profile $selected_type | Slots Available: $available_instances | Node: $numa_node"
+            local node_str=$numa_node
+            if [[ "$numa_node" == "-1" ]]; then node_str="unknown"; fi
+            log "  Registered GPU $pci_slot: Profile $selected_type | Slots Available: $available_instances | Node: $node_str"
         else
             warn "  GPU $pci_slot ignored: $selected_type valid, but 0 slots available after VRAM check."
         fi
@@ -2008,36 +2259,11 @@ discover_gpus
 log "--- PHASE 2: Reading VM Configurations ---"
 declare -A VMS_TO_CONFIGURE VM_DISK_NODE_PREFERENCE VM_DISK_NODE_SOURCE
 declare -A VM_MEMORY_MB VM_HUGEPAGE_1G_PAGES VM_HAS_HOOKSCRIPT VM_HOOKSCRIPT_VALUE
-declare -A NODE_1G_HUGEPAGES_TOTAL NODE_1G_HUGEPAGES_PLANNED NODE_1G_HUGEPAGES_FREE
 TOTAL_CORES_REQUESTED=0
 
-HUGEPAGE_NODE_SAFETY_PAGES=$(jq -r '.global_settings.hugepage_node_safety_pages // 2' "$CONFIG_FILE")
-if [[ ! "$HUGEPAGE_NODE_SAFETY_PAGES" =~ ^[0-9]+$ ]]; then
-    HUGEPAGE_NODE_SAFETY_PAGES=2
-fi
+# (Per-node memory and 1G hugepage pools were discovered in Phase 1, where
+# the -a host-core auto-selection already needs them.)
 log "  Hugepage node safety margin: ${HUGEPAGE_NODE_SAFETY_PAGES} x 1G page(s)."
-
-for node_id in "${NUMA_NODE_IDS[@]}"; do
-    hp_dir="${NODE_SYS_BASE}/node${node_id}/hugepages/hugepages-1048576kB"
-    NODE_1G_HUGEPAGES_PLANNED["$node_id"]=0
-    NODE_1G_HUGEPAGES_TOTAL["$node_id"]=-1
-    NODE_1G_HUGEPAGES_FREE["$node_id"]=-1
-    if [[ -f "$hp_dir/nr_hugepages" ]]; then
-        hp_total=$(cat "$hp_dir/nr_hugepages" 2>/dev/null || echo "-1")
-        if [[ "$hp_total" =~ ^[0-9]+$ ]]; then
-            NODE_1G_HUGEPAGES_TOTAL["$node_id"]=$hp_total
-        fi
-    fi
-    # Free pages matter too: nr_hugepages counts pages already consumed by
-    # running VMs (including ones outside this config), which the planner
-    # cannot reclaim.
-    if [[ -f "$hp_dir/free_hugepages" ]]; then
-        hp_free=$(cat "$hp_dir/free_hugepages" 2>/dev/null || echo "-1")
-        if [[ "$hp_free" =~ ^[0-9]+$ ]]; then
-            NODE_1G_HUGEPAGES_FREE["$node_id"]=$hp_free
-        fi
-    fi
-done
 
 # Cheap serial pass: VM core counts and the running total come straight from the
 # config (jq), no per-VM subprocess latency, and the total must accumulate in order.
@@ -2207,10 +2433,13 @@ node_hugepage_fits() {
     local node_id=$1
     local vmid=$2
     local use_safety_margin=$3
-    local total_pages=${NODE_1G_HUGEPAGES_TOTAL[$node_id]:--1}
     local planned_pages=${NODE_1G_HUGEPAGES_PLANNED[$node_id]:-0}
     local vm_pages=${VM_HUGEPAGE_1G_PAGES[$vmid]:-0}
-    local limit_pages
+    local total_pages limit_pages
+
+    # Capacity = the node's hugepage pool, or the MemTotal estimate when no
+    # pool is configured yet. Unknown (-1) keeps the node unconstrained.
+    total_pages=$(node_capacity_1g_pages "$node_id"); total_pages=${total_pages%%|*}
 
     if (( total_pages < 0 || vm_pages <= 0 )); then
         return 0
@@ -2258,7 +2487,11 @@ preflight_gpu_cpu_feasibility() {
         warn "Skipping exact pre-flight hugepage feasibility check: mixed VM memory sizes detected."
     fi
 
+    # Slots on GPUs whose NUMA locality is unknown (-1) or whose node is
+    # excluded by vm_nodes are "floating": the vGPU is attached cross-node, so
+    # they can pair with any allowed node that still has cores/memory room.
     local -A node_gpu_slots=()
+    local floating_gpu_slots=0
     local pci node_id
     for node_id in "${NUMA_NODE_IDS[@]}"; do
         node_gpu_slots["$node_id"]=0
@@ -2266,12 +2499,16 @@ preflight_gpu_cpu_feasibility() {
 
     for pci in "${GPU_PCI_IDS[@]}"; do
         node_id=${GPU_MAP[$pci]}
-        node_gpu_slots["$node_id"]=$(( ${node_gpu_slots[$node_id]:-0} + ${GPU_SLOTS_FREE[$pci]:-0} ))
+        if [[ "$node_id" != "-1" ]] && node_allowed "$node_id"; then
+            node_gpu_slots["$node_id"]=$(( ${node_gpu_slots[$node_id]:-0} + ${GPU_SLOTS_FREE[$pci]:-0} ))
+        else
+            floating_gpu_slots=$(( floating_gpu_slots + ${GPU_SLOTS_FREE[$pci]:-0} ))
+        fi
     done
 
     local total_pairable_vms=0
     local node_free_cores cores_limited_vms slot_limited_vms pairable_on_node
-    local node_hugepages_total hugepage_limited_vms
+    local node_capacity_pages hugepage_limited_vms floating_take
     local avail_phys_list avail_smt_list
     local hugepage_context=""
 
@@ -2280,30 +2517,41 @@ preflight_gpu_cpu_feasibility() {
     fi
 
     log "--- PHASE 2.5: Pre-flight GPU/CPU Feasibility (Best Effort) ---"
+    if (( floating_gpu_slots > 0 )); then
+        log "  ${floating_gpu_slots} GPU slot(s) float (unknown NUMA locality or node excluded by vm_nodes); they pair with any allowed node."
+    fi
     for node_id in "${NUMA_NODE_IDS[@]}"; do
         avail_phys_list=(${AVAILABLE_PHYS_CORES["$node_id"]:-})
         avail_smt_list=(${AVAILABLE_SMT_CORES["$node_id"]:-})
         node_free_cores=$(( ${#avail_phys_list[@]} + ${#avail_smt_list[@]} ))
 
         cores_limited_vms=$(( node_free_cores / per_vm_cores ))
-        slot_limited_vms=${node_gpu_slots[$node_id]:-0}
-        pairable_on_node=$cores_limited_vms
-        if (( slot_limited_vms < pairable_on_node )); then
-            pairable_on_node=$slot_limited_vms
+
+        node_capacity_pages=$(node_capacity_1g_pages "$node_id"); node_capacity_pages=${node_capacity_pages%%|*}
+        hugepage_limited_vms=$cores_limited_vms
+        if [[ "$strict_hugepage_check" == "true" && "$per_vm_pages" =~ ^[0-9]+$ && $per_vm_pages -gt 0 && $node_capacity_pages -ge 0 ]]; then
+            hugepage_limited_vms=$(( node_capacity_pages / per_vm_pages ))
         fi
 
-        node_hugepages_total=${NODE_1G_HUGEPAGES_TOTAL[$node_id]:--1}
-        hugepage_limited_vms=$pairable_on_node
-        if [[ "$strict_hugepage_check" == "true" && "$per_vm_pages" =~ ^[0-9]+$ && $per_vm_pages -gt 0 && $node_hugepages_total -ge 0 ]]; then
-            hugepage_limited_vms=$(( node_hugepages_total / per_vm_pages ))
-            if (( hugepage_limited_vms < pairable_on_node )); then
-                pairable_on_node=$hugepage_limited_vms
+        # Cores/memory bound first; node-local slots fill it, floating slots
+        # top up whatever room is left.
+        pairable_on_node=$cores_limited_vms
+        if (( hugepage_limited_vms < pairable_on_node )); then
+            pairable_on_node=$hugepage_limited_vms
+        fi
+        slot_limited_vms=${node_gpu_slots[$node_id]:-0}
+        if (( slot_limited_vms < pairable_on_node )); then
+            floating_take=$(( pairable_on_node - slot_limited_vms ))
+            if (( floating_take > floating_gpu_slots )); then
+                floating_take=$floating_gpu_slots
             fi
+            floating_gpu_slots=$(( floating_gpu_slots - floating_take ))
+            pairable_on_node=$(( slot_limited_vms + floating_take ))
         fi
 
         total_pairable_vms=$(( total_pairable_vms + pairable_on_node ))
-        if [[ "$strict_hugepage_check" == "true" && "$per_vm_pages" =~ ^[0-9]+$ && $per_vm_pages -gt 0 && $node_hugepages_total -ge 0 ]]; then
-            log "  Node $node_id: free_cores=$node_free_cores, gpu_slots=${node_gpu_slots[$node_id]:-0}, hugepages_total=$node_hugepages_total, max_pairable_vms=$pairable_on_node"
+        if [[ "$strict_hugepage_check" == "true" && "$per_vm_pages" =~ ^[0-9]+$ && $per_vm_pages -gt 0 && $node_capacity_pages -ge 0 ]]; then
+            log "  Node $node_id: free_cores=$node_free_cores, gpu_slots=${node_gpu_slots[$node_id]:-0}, capacity_1g_pages=$node_capacity_pages, max_pairable_vms=$pairable_on_node"
         else
             log "  Node $node_id: free_cores=$node_free_cores, gpu_slots=${node_gpu_slots[$node_id]:-0}, max_pairable_vms=$pairable_on_node"
         fi
@@ -2351,12 +2599,14 @@ log_pairing_debug_state() {
         local avail_smt_list=(${AVAILABLE_SMT_CORES["$node_id"]:-})
         local total_avail=$(( ${#avail_phys_list[@]} + ${#avail_smt_list[@]} ))
         local node_gpu_slots=0
-        local node_hugepages_total=${NODE_1G_HUGEPAGES_TOTAL[$node_id]:--1}
+        local cap_info node_capacity_pages cap_source
+        cap_info=$(node_capacity_1g_pages "$node_id")
+        node_capacity_pages=${cap_info%%|*}; cap_source=${cap_info##*|}
         local node_hugepages_planned=${NODE_1G_HUGEPAGES_PLANNED[$node_id]:-0}
         local node_hugepages_remaining="n/a"
 
-        if (( node_hugepages_total >= 0 )); then
-            node_hugepages_remaining=$(( node_hugepages_total - node_hugepages_planned ))
+        if (( node_capacity_pages >= 0 )); then
+            node_hugepages_remaining=$(( node_capacity_pages - node_hugepages_planned ))
         fi
 
         for pci in "${GPU_PCI_IDS[@]}"; do
@@ -2365,11 +2615,13 @@ log_pairing_debug_state() {
             fi
         done
 
-        warn "  Node $node_id: free_cores=$total_avail, free_gpu_slots=$node_gpu_slots, hugepages_planned=$node_hugepages_planned, hugepages_total=$node_hugepages_total, hugepages_remaining=$node_hugepages_remaining"
+        warn "  Node $node_id: free_cores=$total_avail, free_gpu_slots=$node_gpu_slots, hugepages_planned=$node_hugepages_planned, capacity_1g_pages=$node_capacity_pages (source: $cap_source), remaining=$node_hugepages_remaining"
     done
 
     for pci in "${GPU_PCI_IDS[@]}"; do
-        warn "  GPU $pci on Node ${GPU_MAP[$pci]}: slots_free=${GPU_SLOTS_FREE[$pci]:-0} (${GPU_MDEV_PROFILE[$pci]})"
+        local gpu_node_str=${GPU_MAP[$pci]}
+        if [[ "$gpu_node_str" == "-1" ]]; then gpu_node_str="unknown"; fi
+        warn "  GPU $pci on Node ${gpu_node_str}: slots_free=${GPU_SLOTS_FREE[$pci]:-0} (${GPU_MDEV_PROFILE[$pci]})"
     done
 }
 
@@ -2385,6 +2637,7 @@ find_best_cpu_only_node() {
     local node_id avail_phys_list avail_smt_list total_avail match_score hugepage_fit_score
 
     for node_id in "${NUMA_NODE_IDS[@]}"; do
+        if ! node_allowed "$node_id"; then continue; fi
         avail_phys_list=(${AVAILABLE_PHYS_CORES["$node_id"]:-})
         avail_smt_list=(${AVAILABLE_SMT_CORES["$node_id"]:-})
         total_avail=$(( ${#avail_phys_list[@]} + ${#avail_smt_list[@]} ))
@@ -2461,11 +2714,17 @@ assign_resources() {
         error "VM $vmid: Node $target_node has insufficient cores! (GPU Locked)"
     fi
 
-    local node_hugepages_total=${NODE_1G_HUGEPAGES_TOTAL[$target_node]:--1}
+    if ! node_allowed "$target_node"; then
+        error "VM $vmid: internal planning error - Node $target_node is excluded by numa_settings.vm_nodes."
+    fi
+
+    local cap_info node_capacity_pages cap_source
+    cap_info=$(node_capacity_1g_pages "$target_node")
+    node_capacity_pages=${cap_info%%|*}; cap_source=${cap_info##*|}
     local node_hugepages_planned=${NODE_1G_HUGEPAGES_PLANNED[$target_node]:-0}
-    if (( node_hugepages_total >= 0 && vm_hugepage_pages > 0 )); then
-        if (( node_hugepages_planned + vm_hugepage_pages > node_hugepages_total )); then
-            error "VM $vmid: Node $target_node has insufficient 1G hugepages! planned=${node_hugepages_planned}, needed=${vm_hugepage_pages}, total=${node_hugepages_total}"
+    if (( node_capacity_pages >= 0 && vm_hugepage_pages > 0 )); then
+        if (( node_hugepages_planned + vm_hugepage_pages > node_capacity_pages )); then
+            error "VM $vmid: Node $target_node has insufficient 1G hugepages! planned=${node_hugepages_planned}, needed=${vm_hugepage_pages}, capacity=${node_capacity_pages} (source: ${cap_source})"
         fi
     fi
 
@@ -2521,50 +2780,72 @@ for vmid in $sorted_vmids; do
     preferred_disk_node=${VM_DISK_NODE_PREFERENCE[$vmid]:-}
     preferred_disk_source=${VM_DISK_NODE_SOURCE[$vmid]:-}
     best_pci=""
+    best_gpu_node=""
     best_hugepage_fit_score=-1
     best_match_score=-1
+    best_local_score=-1
     max_free_cores=-1
     slot_and_core_candidates=0
     slot_core_hugepage_blocked=0
 
-    # 1. SCAN for Best Candidate
+    # 1. SCAN for Best Candidate (GPU slot x placement node). A GPU whose NUMA
+    #    node is known and allowed anchors its VM to that node (NUMA-local, as
+    #    before). A GPU with unknown locality (numa_node -1, common on
+    #    single-socket boards) or on a node excluded by vm_nodes no longer
+    #    force-places the VM there: every allowed node competes on memory fit /
+    #    disk locality / free cores, and the vGPU is attached cross-node.
     for pci in "${GPU_PCI_IDS[@]}"; do
         if [[ ${GPU_SLOTS_FREE[$pci]} -gt 0 ]]; then
-            node=${GPU_MAP[$pci]}
-            match_score=0
-            hugepage_fit_score=1
-
-            # Count free cores on this node (Global Vars used, NO LOCAL)
-            avail_phys_list=(${AVAILABLE_PHYS_CORES["$node"]:-})
-            avail_smt_list=(${AVAILABLE_SMT_CORES["$node"]:-})
-            total_avail=$(( ${#avail_phys_list[@]} + ${#avail_smt_list[@]} ))
-
-            if (( cpu_count > total_avail )); then
-                continue
+            gpu_actual_node=${GPU_MAP[$pci]}
+            candidate_nodes=()
+            if [[ "$gpu_actual_node" != "-1" ]] && node_allowed "$gpu_actual_node"; then
+                candidate_nodes=("$gpu_actual_node")
+            else
+                candidate_nodes=("${NUMA_NODE_IDS[@]}")
             fi
 
-            slot_and_core_candidates=$(( slot_and_core_candidates + 1 ))
+            for node in "${candidate_nodes[@]}"; do
+                if ! node_allowed "$node"; then continue; fi
+                match_score=0
+                hugepage_fit_score=1
+                local_score=0
+                if [[ "$gpu_actual_node" == "$node" ]]; then local_score=1; fi
 
-            if ! node_hugepage_fits "$node" "$vmid" "false"; then
-                slot_core_hugepage_blocked=$(( slot_core_hugepage_blocked + 1 ))
-                continue
-            fi
+                # Count free cores on this node (Global Vars used, NO LOCAL)
+                avail_phys_list=(${AVAILABLE_PHYS_CORES["$node"]:-})
+                avail_smt_list=(${AVAILABLE_SMT_CORES["$node"]:-})
+                total_avail=$(( ${#avail_phys_list[@]} + ${#avail_smt_list[@]} ))
 
-            if [[ -n "$preferred_disk_node" && "$node" == "$preferred_disk_node" ]]; then
-                match_score=1
-            fi
-            if ! node_hugepage_fits "$node" "$vmid" "true"; then
-                hugepage_fit_score=0
-            fi
+                if (( cpu_count > total_avail )); then
+                    continue
+                fi
 
-            if (( hugepage_fit_score > best_hugepage_fit_score \
-                || (hugepage_fit_score == best_hugepage_fit_score && match_score > best_match_score) \
-                || (hugepage_fit_score == best_hugepage_fit_score && match_score == best_match_score && total_avail > max_free_cores) )); then
-                best_hugepage_fit_score=$hugepage_fit_score
-                best_match_score=$match_score
-                max_free_cores=$total_avail
-                best_pci=$pci
-            fi
+                slot_and_core_candidates=$(( slot_and_core_candidates + 1 ))
+
+                if ! node_hugepage_fits "$node" "$vmid" "false"; then
+                    slot_core_hugepage_blocked=$(( slot_core_hugepage_blocked + 1 ))
+                    continue
+                fi
+
+                if [[ -n "$preferred_disk_node" && "$node" == "$preferred_disk_node" ]]; then
+                    match_score=1
+                fi
+                if ! node_hugepage_fits "$node" "$vmid" "true"; then
+                    hugepage_fit_score=0
+                fi
+
+                if (( hugepage_fit_score > best_hugepage_fit_score \
+                    || (hugepage_fit_score == best_hugepage_fit_score && match_score > best_match_score) \
+                    || (hugepage_fit_score == best_hugepage_fit_score && match_score == best_match_score && local_score > best_local_score) \
+                    || (hugepage_fit_score == best_hugepage_fit_score && match_score == best_match_score && local_score == best_local_score && total_avail > max_free_cores) )); then
+                    best_hugepage_fit_score=$hugepage_fit_score
+                    best_match_score=$match_score
+                    best_local_score=$local_score
+                    max_free_cores=$total_avail
+                    best_pci=$pci
+                    best_gpu_node=$node
+                fi
+            done
         fi
     done
 
@@ -2586,8 +2867,15 @@ for vmid in $sorted_vmids; do
         assign_resources "$vmid" "$best_node" "" ""
     elif [[ -n "$best_pci" ]]; then
         pci=$best_pci
-        node=${GPU_MAP[$pci]}
+        node=$best_gpu_node
         mdev=${GPU_MDEV_PROFILE[$pci]}
+        gpu_actual_node=${GPU_MAP[$pci]}
+
+        if [[ "$gpu_actual_node" == "-1" ]]; then
+            log "  GPU $pci NUMA locality unknown; VM $vmid placed by memory/core fit."
+        elif [[ "$gpu_actual_node" != "$node" ]]; then
+            warn "  VM $vmid: cross-node vGPU - GPU $pci sits on Node $gpu_actual_node but the VM is placed on Node $node (vm_nodes/memory constraints); expect some PCIe traffic across the interconnect."
+        fi
 
         if [[ -n "$preferred_disk_node" ]]; then
             log "  Assigning GPU $pci ($mdev) on Node $node to VM $vmid (disk prefers Node $preferred_disk_node via $preferred_disk_source, matched=$([ "$node" == "$preferred_disk_node" ] && echo yes || echo no), Node Free: $max_free_cores)"
@@ -2640,15 +2928,29 @@ for node_id in "${NUMA_NODE_IDS[@]}"; do
     node_hp_total=${NODE_1G_HUGEPAGES_TOTAL[$node_id]:--1}
     node_hp_planned=${NODE_1G_HUGEPAGES_PLANNED[$node_id]:-0}
     node_hp_free=${NODE_1G_HUGEPAGES_FREE[$node_id]:--1}
-    if (( node_hp_total >= 0 )); then
+    node_cap_info=$(node_capacity_1g_pages "$node_id")
+    node_cap_pages=${node_cap_info%%|*}; node_cap_source=${node_cap_info##*|}
+    if [[ "$node_cap_source" == "pool" ]]; then
         log "  Node $node_id hugepages(1G): planned=${node_hp_planned}, total=${node_hp_total}, free=${node_hp_free}, safety_margin=${HUGEPAGE_NODE_SAFETY_PAGES}"
         if (( node_hp_free >= 0 && node_hp_planned > node_hp_free )); then
             warn "  Node $node_id: plan needs ${node_hp_planned}x1G hugepages but only ${node_hp_free} are free right now. Pages held by VMs being reconfigured free up when they restart; pages held by VMs outside this config do not -- starts may fail until then."
         fi
     elif (( node_hp_planned > 0 )); then
-        warn "  Node $node_id: ${node_hp_planned}x1G hugepages planned, but this node exposes no 1G hugepage pool. VMs are configured with 'hugepages: 1024' and will not start until 1G pages exist (e.g. default_hugepagesz=1G hugepagesz=1G hugepages=N on the kernel cmdline)."
+        # Advise planned + safety margin: a pool sized to exactly the plan
+        # scores 0 on the margin check next run and can push the last VM onto
+        # a worse node.
+        suggest_pages=$(( node_hp_planned + HUGEPAGE_NODE_SAFETY_PAGES ))
+        if [[ "$node_cap_source" == "memtotal" ]]; then
+            if (( suggest_pages > node_cap_pages )); then
+                suggest_pages=$node_cap_pages
+            fi
+            warn "  Node $node_id: ${node_hp_planned}x1G hugepages planned (within the ~${node_cap_pages}-page capacity estimated from this node's MemTotal), but no 1G hugepages are allocated on it yet. VMs are configured with 'hugepages: 1024' and will not start until they are. Create the pool with: echo ${suggest_pages} > ${NODE_SYS_BASE}/node${node_id}/hugepages/hugepages-1048576kB/nr_hugepages  (planned ${node_hp_planned} + ${HUGEPAGE_NODE_SAFETY_PAGES} safety margin; persistent: default_hugepagesz=1G hugepagesz=1G hugepages=${node_id}:${suggest_pages} on the kernel cmdline. The per-node syntax matters on asymmetric-memory hosts: a plain hugepages=N is spread evenly across nodes and will not fit.)"
+        else
+            warn "  Node $node_id: ${node_hp_planned}x1G hugepages planned, but this node exposes no 1G hugepage pool. VMs are configured with 'hugepages: 1024' and will not start until 1G pages exist (e.g. default_hugepagesz=1G hugepagesz=1G hugepages=${node_id}:${suggest_pages} on the kernel cmdline; the <node>:<count> syntax allocates on that node only, sized planned + safety margin)."
+        fi
     fi
 done
+unset node_cap_info node_cap_pages node_cap_source suggest_pages
 
 create_state_file
 log "Planning Complete."

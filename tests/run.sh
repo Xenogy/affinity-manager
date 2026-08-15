@@ -124,6 +124,15 @@ make_node_hugepages() {
     export NODE_SYS_BASE="$WORK/fake-node"
 }
 
+# make_node_meminfo <node> <mem_total_mb>: fake NUMA-node meminfo (kernel format)
+make_node_meminfo() {
+    local d="$WORK/fake-node/node$1"
+    mkdir -p "$d"
+    printf 'Node %s MemTotal:       %s kB\nNode %s MemFree:        %s kB\n' \
+        "$1" "$(( $2 * 1024 ))" "$1" "$(( $2 * 1024 ))" > "$d/meminfo"
+    export NODE_SYS_BASE="$WORK/fake-node"
+}
+
 # make_irq <number> <device-name> <affinity-list> [effective-list]
 make_irq() {
     local d="$IRQ_PROC_BASE/$1"
@@ -953,6 +962,235 @@ EOF
 run_manager -f "$WORK/config.json" -n -g
 assert_exit_code 1 "$RUN_RC" "typo'd reserve_host_cores exits 1"
 assert_grep "$WORK/run.log" "reserve_host_cores must be true or false \(got 'ture'\)" "typo rejected instead of silently unreserving"
+
+# =============================================================================
+scenario "asymmetric per-node memory keeps VMs off the small node (no hugepage pools)"
+# Single socket, two nodes: node 0 = 8GB (host), node 1 = 32GB (VMs). No 1G
+# hugepage pools configured, so capacity comes from MemTotal. Disk locality
+# adversarially prefers the SMALL node -- memory fit must outrank it.
+export LSCPU_TOPOLOGY="$FIXTURES/topology-1s-2node.csv"
+export QM_FIXTURE_DIR="$FIXTURES/qm-asym"
+make_node_meminfo 0 8192
+make_node_meminfo 1 32768
+cat > "$WORK/config.json" <<'EOF'
+{
+  "global_settings": { "reserve_host_cores": true, "host_cores": [0, 8] },
+  "disk_settings": { "storage_node_map": { "local-lvm": "node:0" } },
+  "vms": { "101": 2, "102": 2, "103": 2, "104": 2 }
+}
+EOF
+run_manager -f "$WORK/config.json" -n -g
+
+assert_exit_code 0 "$RUN_RC" "exits 0"
+assert_grep "$WORK/run.log" "Node 0: memory 8192 MB, 1G hugepage pool: none" "node 0 memory discovered"
+assert_grep "$WORK/run.log" "Node 1: memory 32768 MB, 1G hugepage pool: none" "node 1 memory discovered"
+# All four 6GB VMs must land on node 1: node 0's estimate is (8192-2048)/1024
+# = 6 pages, so a 6-page VM only fits with zero safety margin left.
+assert_grep "$WORK/run.log" "Assigning VM 101 to Node 1" "VM 101 on the big node"
+assert_grep "$WORK/run.log" "Assigning VM 104 to Node 1" "VM 104 on the big node"
+assert_not_grep "$WORK/run.log" "Assigning VM 10[0-9] to Node 0" "no VM lands on the 8GB node despite disk preference"
+STATE="$WORK/manager_state.json.dryrun"
+assert_json "$STATE" '[.core_assignments[].numa_node] | all(. == 1)' "state file confirms all VMs on node 1"
+# Missing pool advice must be per-node and sized planned+safety (24+2), not
+# an even split and not exactly the plan (which would starve the margin check
+# on the next run).
+assert_grep "$WORK/run.log" "Node 1: 24x1G hugepages planned .*estimated from this node's MemTotal" "capacity-aware pool warning"
+assert_grep "$WORK/run.log" "echo 26 > .*node1/hugepages" "sysfs pool creation suggested with safety margin"
+assert_grep "$WORK/run.log" "hugepages=1:26 on the kernel cmdline" "per-node hugepage cmdline suggested"
+
+# =============================================================================
+scenario "GPU with unknown NUMA locality (-1) is not force-placed on node 0"
+export LSCPU_TOPOLOGY="$FIXTURES/topology-1s-2node.csv"
+export QM_FIXTURE_DIR="$FIXTURES/qm-asym"
+export LSPCI_FIXTURE="$FIXTURES/lspci-one-gpu.txt"
+export NVIDIA_SMI_MEM_MB=32768
+make_node_meminfo 0 8192
+make_node_meminfo 1 32768
+# Real-host default: the 1G pool files EXIST and read 0 (nothing allocated).
+# A zero pool must fall through to the MemTotal estimate, not read as a hard
+# pool of zero that blocks every node.
+make_node_hugepages 0 0
+make_node_hugepages 1 0
+make_gpu 0000:04:00.0 -1 nvidia-47 8
+cat > "$WORK/config.json" <<'EOF'
+{
+  "global_settings": { "reserve_host_cores": true, "host_cores": [0, 8] },
+  "gpu_settings": {
+    "required_vram_mb": 2048,
+    "auto_detect_profile": false,
+    "gpu_profile_map": { "0000:04:00.0": "nvidia-47" }
+  },
+  "vms": { "101": 2, "102": 2, "103": 2, "104": 2 }
+}
+EOF
+run_manager -f "$WORK/config.json" -n
+
+assert_exit_code 0 "$RUN_RC" "exits 0"
+assert_grep "$WORK/run.log" "Registered GPU 0000:04:00.0: Profile nvidia-47 \| Slots Available: 8 \| Node: unknown" "GPU registered with unknown locality (was: coerced to node 0)"
+assert_grep "$WORK/run.log" "GPU 0000:04:00.0 NUMA locality unknown; VM 10[0-9] placed by memory/core fit" "placement decoupled from fake node 0"
+# Pre-flight: the unknown-locality GPU's slots must float (pairable with any
+# node) instead of counting against one node.
+assert_grep "$WORK/run.log" "8 GPU slot\(s\) float \(unknown NUMA locality or node excluded by vm_nodes\)" "unknown-GPU slots float in preflight"
+assert_grep "$WORK/run.log" "Pre-flight passed: requested 4 GPU VM\(s\), max pairable is 5" "preflight pairs floating slots against per-node core/memory room"
+assert_grep "$WORK/run.log" "Assigning GPU 0000:04:00.0 \(nvidia-47\) on Node 1 to VM 101" "GPU VM 101 lands on the big-memory node"
+assert_grep "$WORK/run.log" "4 VM\(s\) with GPU, 0 VM\(s\) CPU-only" "all VMs still get a vGPU"
+assert_not_grep "$WORK/run.log" "Assigning GPU .* on Node 0" "no GPU VM bound to the 8GB node"
+STATE="$WORK/manager_state.json.dryrun"
+assert_json "$STATE" '[.core_assignments[].numa_node] | all(. == 1)' "state file confirms all GPU VMs on node 1"
+
+# =============================================================================
+scenario "numa_settings.vm_nodes pins VMs to node 1, -a host cores to node 0, cross-node vGPU warned"
+export LSCPU_TOPOLOGY="$FIXTURES/topology-1s-2node.csv"
+export QM_FIXTURE_DIR="$FIXTURES/qm-asym"
+export LSPCI_FIXTURE="$FIXTURES/lspci-one-gpu.txt"
+export NVIDIA_SMI_MEM_MB=32768
+# The GPU claims node 0 -- excluded by vm_nodes, so the vGPU must be handed
+# out cross-node instead of dragging VMs onto the host node.
+make_gpu 0000:04:00.0 0 nvidia-47 8
+cat > "$WORK/config.json" <<'EOF'
+{
+  "global_settings": { "reserve_host_cores": true, "host_cores": [] },
+  "gpu_settings": {
+    "required_vram_mb": 2048,
+    "auto_detect_profile": false,
+    "gpu_profile_map": { "0000:04:00.0": "nvidia-47" }
+  },
+  "numa_settings": { "vm_nodes": [1] },
+  "vms": { "101": 2, "102": 2, "103": 2, "104": 2 }
+}
+EOF
+run_manager -f "$WORK/config.json" -n -a 1
+
+assert_exit_code 0 "$RUN_RC" "exits 0"
+assert_grep "$WORK/run.log" "VM placement restricted to NUMA node\(s\): 1" "vm_nodes allowlist parsed"
+assert_grep "$WORK/run.log" "Host-core candidates restricted to non-VM node\(s\): 0" "-a considers only the non-VM node"
+assert_grep "$WORK/run.log" "Auto-selected host cores: \[0,1,8,9\]" "host cores picked on node 0"
+assert_grep "$WORK/run.log" "Node 0: excluded from VM placement \(numa_settings.vm_nodes\)" "node 0 contributes no VM cores"
+assert_grep "$WORK/run.log" "cross-node vGPU - GPU 0000:04:00.0 sits on Node 0 but the VM is placed on Node 1" "cross-node vGPU warned"
+assert_grep "$WORK/run.log" "Assigning GPU 0000:04:00.0 \(nvidia-47\) on Node 1 to VM 101" "GPU VM placed on the allowed node"
+assert_grep "$WORK/run.log" "4 VM\(s\) with GPU, 0 VM\(s\) CPU-only" "excluded-node GPU still fully used"
+assert_not_grep "$WORK/run.log" "Assigning GPU .* on Node 0 to VM" "no VM placed on the excluded node"
+assert_not_grep "$WORK/run.log" "Assigning VM 10[0-9] to Node 0" "no CPU-only fallback on the excluded node"
+STATE="$WORK/manager_state.json.dryrun"
+assert_json "$STATE" '[.core_assignments[].numa_node] | all(. == 1)' "state file confirms all VMs on node 1"
+
+# =============================================================================
+scenario "-a on a memory-asymmetric host reserves host cores on the small node"
+export LSCPU_TOPOLOGY="$FIXTURES/topology-1s-2node.csv"
+export QM_FIXTURE_DIR="$FIXTURES/qm-asym"
+# The SMALL node is node 1 here, deliberately NOT the selection loop's initial
+# candidate (node 0) -- so this scenario fails if the smallest-memory
+# comparison stops firing, instead of passing by coincidence.
+make_node_meminfo 0 32768
+make_node_meminfo 1 8192
+cat > "$WORK/config.json" <<'EOF'
+{
+  "global_settings": { "reserve_host_cores": true, "host_cores": [] },
+  "vms": { "101": 2, "102": 2, "103": 2, "104": 2 }
+}
+EOF
+run_manager -f "$WORK/config.json" -n -g -a 1
+
+assert_exit_code 0 "$RUN_RC" "exits 0"
+assert_grep "$WORK/run.log" "Smallest-memory NUMA node: Node 1 .*memory-asymmetric host" "memory outranks GPU load on a 4x-asymmetric host"
+assert_grep "$WORK/run.log" "Auto-selected host cores: \[4,5,12,13\]" "host cores land on the 8GB node"
+assert_grep "$WORK/run.log" "Assigning VM 101 to Node 0" "VMs stay on the 32GB node"
+assert_not_grep "$WORK/run.log" "Assigning VM 10[0-9] to Node 1" "no VM lands on the host node"
+assert_grep "$WORK/run.log" "Planning Complete" "planning completes"
+
+# =============================================================================
+scenario "numa_settings validation fails fast; socket entries expand to all their nodes"
+export LSCPU_TOPOLOGY="$FIXTURES/topology-1s-2node.csv"
+export QM_FIXTURE_DIR="$FIXTURES/qm-asym"
+
+mk_numa_cfg() {
+    cat > "$WORK/config.json" <<EOF
+{
+  "global_settings": { "reserve_host_cores": true, "host_cores": [0, 8] },
+  "numa_settings": $1,
+  "vms": { "101": 2 }
+}
+EOF
+}
+
+# 'node:N' naming a nonexistent node must fail at config validation, not
+# surface later as a misleading "no NUMA node has enough free cores" after
+# silently excluding every real node.
+mk_numa_cfg '{ "vm_nodes": ["node:5"] }'
+run_manager -f "$WORK/config.json" -n -g
+assert_exit_code 1 "$RUN_RC" "nonexistent node:N exits 1"
+assert_grep "$WORK/run.log" "vm_nodes entry 'node:5' does not resolve to a NUMA node on this host \(nodes: 0 1\)" "node:N validated against topology"
+assert_not_grep "$WORK/run.log" "excluded from VM placement" "no exclusion happens on a rejected config"
+
+mk_numa_cfg '{ "vm_nodes": [] }'
+run_manager -f "$WORK/config.json" -n -g
+assert_exit_code 1 "$RUN_RC" "empty vm_nodes exits 1"
+assert_grep "$WORK/run.log" "vm_nodes is present but empty" "empty allowlist rejected"
+
+mk_numa_cfg '{ "vm_nodes": 1 }'
+run_manager -f "$WORK/config.json" -n -g
+assert_exit_code 1 "$RUN_RC" "non-array vm_nodes exits 1"
+assert_grep "$WORK/run.log" "vm_nodes must be an array of node values \(got JSON type 'number'\)" "non-array type rejected, not silently ignored"
+
+mk_numa_cfg '{ "host_memory_reserve_mb": "lots" }'
+run_manager -f "$WORK/config.json" -n -g
+assert_exit_code 1 "$RUN_RC" "non-integer host_memory_reserve_mb exits 1"
+assert_grep "$WORK/run.log" "host_memory_reserve_mb must be a non-negative integer \(got 'lots'\)" "bad reserve rejected"
+
+# socket:0 spans BOTH nodes on this single-socket topology: the hard allowlist
+# must cover both, not just the socket's first node.
+mk_numa_cfg '{ "vm_nodes": ["socket:0"] }'
+run_manager -f "$WORK/config.json" -n -g
+assert_exit_code 0 "$RUN_RC" "socket:0 exits 0"
+assert_grep "$WORK/run.log" "VM placement restricted to NUMA node\(s\): 0 1" "socket entry expands to every node of the socket"
+assert_not_grep "$WORK/run.log" "excluded from VM placement" "no node of the socket is excluded"
+
+# =============================================================================
+scenario "hugepage pool on one node only: pool is authoritative there, MemTotal elsewhere"
+export LSCPU_TOPOLOGY="$FIXTURES/topology-1s-2node.csv"
+export QM_FIXTURE_DIR="$FIXTURES/qm-asym"
+make_node_meminfo 0 8192
+make_node_meminfo 1 32768
+# Real-host shape after following the advice: node 0 keeps the default 0-page
+# pool (hard zero, since node 1 HAS an allocated pool), node 1 has 28 pages.
+make_node_hugepages 0 0
+make_node_hugepages 1 28
+cat > "$WORK/config.json" <<'EOF'
+{
+  "global_settings": { "reserve_host_cores": true, "host_cores": [0, 8] },
+  "vms": { "101": 2, "102": 2, "103": 2, "104": 2 }
+}
+EOF
+run_manager -f "$WORK/config.json" -n -g
+
+assert_exit_code 0 "$RUN_RC" "exits 0"
+assert_grep "$WORK/run.log" "Node 1: memory 32768 MB, 1G hugepage pool: 28 page\(s\), 28 free" "allocated pool discovered"
+assert_grep "$WORK/run.log" "Assigning VM 101 to Node 1" "VMs follow the allocated pool"
+assert_not_grep "$WORK/run.log" "Assigning VM 10[0-9] to Node 0" "hard 0-page pool keeps VMs off node 0"
+assert_grep "$WORK/run.log" "Node 1 hugepages\(1G\): planned=24, total=28, free=28" "pool accounting reported"
+assert_not_grep "$WORK/run.log" "estimated from this node's MemTotal" "no MemTotal advice once pools are administered"
+
+# =============================================================================
+scenario "--no-reserve on an asymmetric host still keeps VMs on the big node"
+export LSCPU_TOPOLOGY="$FIXTURES/topology-1s-2node.csv"
+export QM_FIXTURE_DIR="$FIXTURES/qm-asym"
+make_node_meminfo 0 8192
+make_node_meminfo 1 32768
+cat > "$WORK/config.json" <<'EOF'
+{
+  "global_settings": { "reserve_host_cores": true, "host_cores": [0, 8] },
+  "vms": { "101": 2, "102": 2, "103": 2, "104": 2 }
+}
+EOF
+run_manager -f "$WORK/config.json" -n -g --no-reserve
+
+assert_exit_code 0 "$RUN_RC" "exits 0"
+# With reservation off the host floats everywhere, so the reserve is deducted
+# from every node's MemTotal estimate -- node 0 still cannot fit a 6GB VM.
+assert_grep "$WORK/run.log" "Assigning VM 101 to Node 1" "VM 101 on the big node"
+assert_grep "$WORK/run.log" "Assigning VM 104 to Node 1" "VM 104 on the big node"
+assert_not_grep "$WORK/run.log" "Assigning VM 10[0-9] to Node 0" "no VM lands on the 8GB node without reservation either"
+assert_grep "$WORK/run.log" "Planning Complete" "planning completes"
 
 # =============================================================================
 echo ""

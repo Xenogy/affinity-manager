@@ -3,8 +3,14 @@
 A single Bash script for Proxmox that pins VM CPUs to dedicated cores and hands out
 NVIDIA vGPU slots automatically. It reads a JSON config, works out a NUMA-aware,
 load-balanced layout — placing each VM on the NUMA node where its disk lives when it
-can — reserves cores for the host, and applies everything with `qm`. It can also run
-CPU-only.
+can, and never on a node whose memory can't hold it — reserves cores for the host,
+and applies everything with `qm`. It can also run CPU-only.
+
+Placement is memory-aware per NUMA node: each node's capacity is its 1G hugepage
+pool when one is configured, else an estimate from the node's `MemTotal` — so hosts
+with asymmetric per-node RAM (e.g. a small DIMM pair for the host on node 0 and big
+DIMMs for the VMs on node 1) plan correctly out of the box. See
+[Hosts with asymmetric per-node memory](#hosts-with-asymmetric-per-node-memory).
 
 Everything is validated **before** anything is mutated: VM existence, core counts,
 host-core topology and plan feasibility are checked first, and host pinning (systemd
@@ -44,7 +50,7 @@ attached. These are warnings only; they never change the exit code.
 |------|-------------|
 | `-f <config.json>` | Path to the config file. Required. |
 | `-n` | Dry run — print the plan, change nothing. |
-| `-a [N]` | Auto-select host cores, consolidated on the least GPU-loaded NUMA node (N per node, default 1). |
+| `-a [N]` | Auto-select host cores, consolidated on one NUMA node (N per node, default 1): a node excluded by `numa_settings.vm_nodes` if set, else the smallest-memory node on memory-asymmetric hosts, else the least GPU-loaded node. |
 | `-b [N]` | Auto-select host cores, balanced across physical sockets (N physical + N SMT per socket). |
 | `-g` | Skip GPU discovery and assignment — CPU-only. |
 | `-i` | Only re-apply device IRQ confinement, then exit (see persistence below). |
@@ -100,6 +106,10 @@ effect — the post-run checks flag this until the booted kernel is clean.
     "disable_ksm": true,
     "cpu_governor": "performance"
   },
+  "numa_settings": {
+    "vm_nodes": [1],
+    "host_memory_reserve_mb": 2048
+  },
   "vms": {
     "101": 4,
     "102": 4
@@ -136,12 +146,72 @@ effect — the post-run checks flag this until the booted kernel is clean.
   ksmd/ksmtuned is pure CPU overhead on the host cores. Stops both and unmerges.
 - `cpu_governor` — cpufreq governor to set on the VM cores (e.g. `"performance"`).
 
+**numa_settings** (all optional)
+- `vm_nodes` — hard allowlist of NUMA nodes VMs may be placed on (values like
+  `1`, `"node:1"`, or `"socket:0"`; a socket entry expands to **every** node of
+  that socket). Every entry is validated against the host topology up front.
+  Nodes not listed contribute no VM cores or memory; `-a` prefers them for the
+  host cores. A vGPU on an excluded node is still handed out — attached
+  cross-node, with a warning.
+- `host_memory_reserve_mb` — memory kept out of a node's VM-capacity estimate
+  where the host lives (the reserved-host-core node(s), or all nodes when
+  reservation is off). Default `2048`. Only used while a node has no 1G
+  hugepage pool yet; a configured pool is authoritative on its own.
+
 **vms** — map of VM ID to the number of cores it gets. Each VM targets one vGPU slot
 (falling back to CPU-only if none fits, or always with `-g`).
 
 Disk locality is detected automatically. To hint it, add an optional `disk_settings`
 block mapping a VM or storage to a node, e.g.
 `{ "disk_settings": { "vm_node_map": { "101": "node:0" } } }`.
+
+## Hosts with asymmetric per-node memory
+
+Some hosts intentionally split RAM unevenly across NUMA nodes — e.g. a single-socket
+board with 2×4GB on node 0 for the host and 2×16GB on node 1 for the VMs. Balancing
+VMs by free cores alone would bind some of them (`policy=bind` + 1G hugepages) to
+the small node, where they can never start. The planner therefore tracks per-node
+memory capacity in 1G-page units:
+
+- **With a 1G hugepage pool configured** on a node, the pool is the capacity —
+  exactly as before.
+- **Without a pool**, capacity is estimated from the node's `MemTotal`, minus
+  `numa_settings.host_memory_reserve_mb` on the node(s) carrying the reserved host
+  cores. Nodes that can't hold a VM's memory are never chosen for it, and nodes
+  that only fit it with no safety margin left are chosen last.
+
+Two more behaviors matter on such hosts:
+
+- **GPUs without NUMA locality are no longer pinned to node 0.** Many single-socket
+  boards report `numa_node = -1` for PCI devices; previously that was treated as
+  node 0 and force-placed every vGPU VM there. Now such a VM is placed on the best
+  node by memory fit, disk locality and free cores, and the vGPU is attached from
+  wherever it is. The same applies to a GPU sitting on a node excluded by
+  `vm_nodes` (cross-node vGPU, with a warning).
+- **`-a` prefers the small node for host cores**: a node excluded by `vm_nodes`
+  when configured; otherwise, when one node has at least twice the memory of
+  another, the smallest-memory node — VMs must live where the RAM is, so the host
+  takes the small node regardless of GPU placement.
+
+A minimal config for the example host above (host on node 0, VMs on node 1):
+
+```json
+{
+  "global_settings": { "reserve_host_cores": true, "host_cores": [] },
+  "numa_settings": { "vm_nodes": [1] },
+  "vms": { "101": 4, "102": 4 }
+}
+```
+
+Run `./manager.sh -f config.json -a 1 -n` to preview: host cores land on node 0,
+every VM on node 1. `numa_settings` is optional — without it the MemTotal-based
+capacity check alone keeps VMs off the small node; `vm_nodes` just makes the intent
+explicit and hard.
+
+When no 1G hugepage pool exists yet, the plan ends with the exact per-node commands
+to create one, e.g. `default_hugepagesz=1G hugepagesz=1G hugepages=1:24` on the
+kernel cmdline. The `<node>:<count>` syntax matters here: a plain `hugepages=N` is
+spread evenly across nodes and will not fit an asymmetric host.
 
 ## How VMs are kept on their cores
 
