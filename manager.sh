@@ -149,6 +149,9 @@ usage() {
     echo "                         memory-asymmetric hosts, else the least GPU-loaded node. Optional."
     echo "  -b [N]:                Auto-select host cores, balanced across physical sockets (N phys + N SMT per socket). Optional."
     echo "  -g:                    Skip GPU discovery and assignment (force CPU-only). Optional."
+    echo "  --ignore-gpu-numa:     Ignore GPU NUMA locality for placement: VMs go to the best node"
+    echo "                         by memory/disk/core fit and the vGPU is attached cross-node when"
+    echo "                         needed. Persistent form: gpu_settings.ignore_numa = true."
     echo "  -i:                    Only re-apply device IRQ confinement, then exit. Optional."
     echo "                         (For boot-time use: see extras/affinity-manager-irq.service.)"
     echo "  --no-reserve:          Run without host core reservation (overrides reserve_host_cores):"
@@ -617,6 +620,7 @@ CORES_PER_NUMA=1
 SKIP_GPU=0
 CONFINE_IRQS_ONLY=0
 NO_RESERVE=0
+IGNORE_GPU_NUMA=0
 INSTALL_HOOK=0
 INSTALL_HOOK_VOLID=""
 INSTALL_IRQ_SERVICE=0
@@ -639,6 +643,7 @@ while [[ $# -gt 0 ]]; do
         -g|--no-gpu) SKIP_GPU=1; shift ;;
         -i|--confine-irqs-only) CONFINE_IRQS_ONLY=1; shift ;;
         --no-reserve) NO_RESERVE=1; shift ;;
+        --ignore-gpu-numa) IGNORE_GPU_NUMA=1; shift ;;
         --install-hook)
             INSTALL_HOOK=1
             if [[ $# -gt 1 && "$2" != -* ]]; then INSTALL_HOOK_VOLID="$2"; shift 2; else shift; fi
@@ -878,6 +883,23 @@ if [[ ! "$HOST_MEMORY_RESERVE_MB" =~ ^[0-9]+$ ]]; then
     error "numa_settings.host_memory_reserve_mb must be a non-negative integer (got '$HOST_MEMORY_RESERVE_MB')."
 fi
 
+# Ignore GPU NUMA locality for placement (--ignore-gpu-numa, or persistently
+# gpu_settings.ignore_numa). For hosts where the PCI topology pins every GPU
+# to one node (often node 0) but the VMs must live on another: every GPU is
+# treated as if its locality were unknown, so the VM goes to the best allowed
+# node by memory/disk/core fit and the vGPU is attached cross-node when
+# needed. NUMA-local placement is still preferred when it fits equally well.
+_cfg_ignore_gpu_numa=$(jq -r '.gpu_settings.ignore_numa // false' "$CONFIG_FILE")
+case "$_cfg_ignore_gpu_numa" in
+    true) IGNORE_GPU_NUMA=1 ;;
+    false|null) ;;
+    *) error "gpu_settings.ignore_numa must be true or false (got '$_cfg_ignore_gpu_numa')." ;;
+esac
+unset _cfg_ignore_gpu_numa
+if [[ $IGNORE_GPU_NUMA -eq 1 && $SKIP_GPU -eq 0 ]]; then
+    log "  GPU NUMA locality is IGNORED for placement (--ignore-gpu-numa / gpu_settings.ignore_numa)."
+fi
+
 for node_id in "${NUMA_NODE_IDS[@]}"; do
     hp_dir="${NODE_SYS_BASE}/node${node_id}/hugepages/hugepages-1048576kB"
     NODE_1G_HUGEPAGES_PLANNED["$node_id"]=0
@@ -1106,6 +1128,9 @@ if [[ $AUTO_HOST_CORES -eq 1 ]]; then
         fi
         while IFS= read -r _pci; do
             [[ -z "$_pci" ]] && continue
+            # With GPU NUMA ignored for placement, GPU locality must not bias
+            # the host-node choice either.
+            if [[ $IGNORE_GPU_NUMA -eq 1 ]]; then continue; fi
             _pci_node=$(cat "${PCI_SYS_BASE}/${_pci}/numa_node" 2>/dev/null || echo -1)
             # A GPU without NUMA locality (-1, common on single-socket boards)
             # says nothing about which node to avoid -- don't count it.
@@ -2499,7 +2524,7 @@ preflight_gpu_cpu_feasibility() {
 
     for pci in "${GPU_PCI_IDS[@]}"; do
         node_id=${GPU_MAP[$pci]}
-        if [[ "$node_id" != "-1" ]] && node_allowed "$node_id"; then
+        if [[ $IGNORE_GPU_NUMA -eq 0 && "$node_id" != "-1" ]] && node_allowed "$node_id"; then
             node_gpu_slots["$node_id"]=$(( ${node_gpu_slots[$node_id]:-0} + ${GPU_SLOTS_FREE[$pci]:-0} ))
         else
             floating_gpu_slots=$(( floating_gpu_slots + ${GPU_SLOTS_FREE[$pci]:-0} ))
@@ -2518,7 +2543,7 @@ preflight_gpu_cpu_feasibility() {
 
     log "--- PHASE 2.5: Pre-flight GPU/CPU Feasibility (Best Effort) ---"
     if (( floating_gpu_slots > 0 )); then
-        log "  ${floating_gpu_slots} GPU slot(s) float (unknown NUMA locality or node excluded by vm_nodes); they pair with any allowed node."
+        log "  ${floating_gpu_slots} GPU slot(s) float (unknown NUMA locality, node excluded by vm_nodes, or --ignore-gpu-numa); they pair with any allowed node."
     fi
     for node_id in "${NUMA_NODE_IDS[@]}"; do
         avail_phys_list=(${AVAILABLE_PHYS_CORES["$node_id"]:-})
@@ -2798,7 +2823,7 @@ for vmid in $sorted_vmids; do
         if [[ ${GPU_SLOTS_FREE[$pci]} -gt 0 ]]; then
             gpu_actual_node=${GPU_MAP[$pci]}
             candidate_nodes=()
-            if [[ "$gpu_actual_node" != "-1" ]] && node_allowed "$gpu_actual_node"; then
+            if [[ $IGNORE_GPU_NUMA -eq 0 && "$gpu_actual_node" != "-1" ]] && node_allowed "$gpu_actual_node"; then
                 candidate_nodes=("$gpu_actual_node")
             else
                 candidate_nodes=("${NUMA_NODE_IDS[@]}")
@@ -2874,7 +2899,12 @@ for vmid in $sorted_vmids; do
         if [[ "$gpu_actual_node" == "-1" ]]; then
             log "  GPU $pci NUMA locality unknown; VM $vmid placed by memory/core fit."
         elif [[ "$gpu_actual_node" != "$node" ]]; then
-            warn "  VM $vmid: cross-node vGPU - GPU $pci sits on Node $gpu_actual_node but the VM is placed on Node $node (vm_nodes/memory constraints); expect some PCIe traffic across the interconnect."
+            if [[ $IGNORE_GPU_NUMA -eq 1 ]]; then
+                # Opted in: cross-node attach is the expected outcome, not a warning.
+                log "  GPU $pci (Node $gpu_actual_node) attached cross-node to VM $vmid on Node $node (--ignore-gpu-numa)."
+            else
+                warn "  VM $vmid: cross-node vGPU - GPU $pci sits on Node $gpu_actual_node but the VM is placed on Node $node (vm_nodes/memory constraints); expect some PCIe traffic across the interconnect."
+            fi
         fi
 
         if [[ -n "$preferred_disk_node" ]]; then

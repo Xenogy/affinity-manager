@@ -53,6 +53,7 @@ attached. These are warnings only; they never change the exit code.
 | `-a [N]` | Auto-select host cores, consolidated on one NUMA node (N per node, default 1): a node excluded by `numa_settings.vm_nodes` if set, else the smallest-memory node on memory-asymmetric hosts, else the least GPU-loaded node. |
 | `-b [N]` | Auto-select host cores, balanced across physical sockets (N physical + N SMT per socket). |
 | `-g` | Skip GPU discovery and assignment — CPU-only. |
+| `--ignore-gpu-numa` | Ignore GPU NUMA locality for placement: VMs go to the best node by memory/disk/core fit and the vGPU is attached cross-node when needed. Persistent form: `"gpu_settings": { "ignore_numa": true }`. |
 | `-i` | Only re-apply device IRQ confinement, then exit (see persistence below). |
 | `-s <volume-id>` | Attach a hook script to each VM (a snippets volume ID, e.g. `local:snippets/vcpu-pin-hook.sh`). |
 | `-r` | Print the commands to undo host core pinning. |
@@ -137,6 +138,9 @@ effect — the post-run checks flag this until the booted kernel is clean.
 - `required_vram_mb` — VRAM per vGPU slot.
 - `auto_detect_profile` — pick the vGPU profile by VRAM automatically.
 - `gpu_profile_map` — pin a specific vGPU profile to a GPU by PCI address.
+- `ignore_numa` — ignore GPU NUMA locality for placement (persistent form of
+  `--ignore-gpu-numa`). Default `false`. NUMA-local placement is still
+  preferred when it fits equally well.
 
 **tuning_settings** (all optional, all default off — they change host-global behavior)
 - `disable_numa_balancing` — automatic NUMA balancing migrates tasks/pages to chase
@@ -188,6 +192,12 @@ Two more behaviors matter on such hosts:
   node by memory fit, disk locality and free cores, and the vGPU is attached from
   wherever it is. The same applies to a GPU sitting on a node excluded by
   `vm_nodes` (cross-node vGPU, with a warning).
+- **When the board pins every GPU to one node** (a reported `numa_node` of `0` is
+  common even when the VMs must live on node 1), a known GPU node still anchors
+  its VMs there by default — the first VM squeezes onto the small node and the
+  rest degrade to CPU-only. Pass `--ignore-gpu-numa` (or set
+  `"gpu_settings": { "ignore_numa": true }`) to place VMs purely by memory /
+  disk / core fit and attach the vGPU cross-node.
 - **`-a` prefers the small node for host cores**: a node excluded by `vm_nodes`
   when configured; otherwise, when one node has at least twice the memory of
   another, the smallest-memory node — VMs must live where the RAM is, so the host
