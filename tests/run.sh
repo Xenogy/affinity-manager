@@ -1030,7 +1030,7 @@ assert_grep "$WORK/run.log" "Registered GPU 0000:04:00.0: Profile nvidia-47 \| S
 assert_grep "$WORK/run.log" "GPU 0000:04:00.0 NUMA locality unknown; VM 10[0-9] placed by memory/core fit" "placement decoupled from fake node 0"
 # Pre-flight: the unknown-locality GPU's slots must float (pairable with any
 # node) instead of counting against one node.
-assert_grep "$WORK/run.log" "8 GPU slot\(s\) float \(unknown NUMA locality or node excluded by vm_nodes\)" "unknown-GPU slots float in preflight"
+assert_grep "$WORK/run.log" "8 GPU slot\(s\) float \(unknown NUMA locality, node excluded by vm_nodes, or --ignore-gpu-numa\)" "unknown-GPU slots float in preflight"
 assert_grep "$WORK/run.log" "Pre-flight passed: requested 4 GPU VM\(s\), max pairable is 5" "preflight pairs floating slots against per-node core/memory room"
 assert_grep "$WORK/run.log" "Assigning GPU 0000:04:00.0 \(nvidia-47\) on Node 1 to VM 101" "GPU VM 101 lands on the big-memory node"
 assert_grep "$WORK/run.log" "4 VM\(s\) with GPU, 0 VM\(s\) CPU-only" "all VMs still get a vGPU"
@@ -1097,6 +1097,64 @@ assert_grep "$WORK/run.log" "Auto-selected host cores: \[4,5,12,13\]" "host core
 assert_grep "$WORK/run.log" "Assigning VM 101 to Node 0" "VMs stay on the 32GB node"
 assert_not_grep "$WORK/run.log" "Assigning VM 10[0-9] to Node 1" "no VM lands on the host node"
 assert_grep "$WORK/run.log" "Planning Complete" "planning completes"
+
+# =============================================================================
+scenario "--ignore-gpu-numa frees GPU VMs from the GPU's reported node"
+export LSCPU_TOPOLOGY="$FIXTURES/topology-1s-2node.csv"
+export QM_FIXTURE_DIR="$FIXTURES/qm-asym"
+export LSPCI_FIXTURE="$FIXTURES/lspci-one-gpu.txt"
+export NVIDIA_SMI_MEM_MB=32768
+make_node_meminfo 0 8192
+make_node_meminfo 1 32768
+make_node_hugepages 0 0
+make_node_hugepages 1 0
+# The board pins the GPU to node 0 (a real reported node, not -1) while the
+# VMs' memory only fits node 1.
+make_gpu 0000:04:00.0 0 nvidia-47 8
+cat > "$WORK/config.json" <<'EOF'
+{
+  "global_settings": { "reserve_host_cores": true, "host_cores": [0, 8] },
+  "gpu_settings": {
+    "required_vram_mb": 2048,
+    "auto_detect_profile": false,
+    "gpu_profile_map": { "0000:04:00.0": "nvidia-47" }
+  },
+  "vms": { "101": 2, "102": 2, "103": 2, "104": 2 }
+}
+EOF
+
+# Without the flag, the known GPU node anchors its VMs: one VM squeezes onto
+# the 8GB node (zero margin), the rest degrade to CPU-only on node 1.
+run_manager -f "$WORK/config.json" -n
+assert_exit_code 0 "$RUN_RC" "baseline exits 0"
+assert_grep "$WORK/run.log" "1 VM\(s\) with GPU, 3 VM\(s\) CPU-only" "baseline: GPU anchored to its node degrades to CPU-only fallbacks"
+
+# With --ignore-gpu-numa every VM gets a vGPU and lands on the big node.
+run_manager -f "$WORK/config.json" -n --ignore-gpu-numa
+assert_exit_code 0 "$RUN_RC" "flag run exits 0"
+assert_grep "$WORK/run.log" "GPU NUMA locality is IGNORED for placement" "flag announced"
+assert_grep "$WORK/run.log" "4 VM\(s\) with GPU, 0 VM\(s\) CPU-only" "all VMs get a vGPU"
+assert_grep "$WORK/run.log" "Assigning GPU 0000:04:00.0 \(nvidia-47\) on Node 1 to VM 101" "GPU VMs placed on the big-memory node"
+assert_not_grep "$WORK/run.log" "Assigning GPU .* on Node 0 to VM" "no VM anchored to the GPU's node"
+assert_grep "$WORK/run.log" "GPU 0000:04:00.0 \(Node 0\) attached cross-node to VM 10[0-9] on Node 1 \(--ignore-gpu-numa\)" "cross-node attach logged, not warned"
+assert_not_grep "$WORK/run.log" "cross-node vGPU - GPU" "no cross-node warning when opted in"
+assert_grep "$WORK/run.log" "8 GPU slot\(s\) float" "all slots float in preflight"
+STATE="$WORK/manager_state.json.dryrun"
+assert_json "$STATE" '[.core_assignments[].numa_node] | all(. == 1)' "state file confirms all VMs on node 1"
+
+# The persistent config form behaves identically.
+jq '.gpu_settings.ignore_numa = true' "$WORK/config.json" > "$WORK/config.json.tmp"
+mv "$WORK/config.json.tmp" "$WORK/config.json"
+run_manager -f "$WORK/config.json" -n
+assert_exit_code 0 "$RUN_RC" "config form exits 0"
+assert_grep "$WORK/run.log" "4 VM\(s\) with GPU, 0 VM\(s\) CPU-only" "gpu_settings.ignore_numa works without the flag"
+
+# A typo'd value must fail fast, matching the reserve_host_cores convention.
+jq '.gpu_settings.ignore_numa = "ture"' "$WORK/config.json" > "$WORK/config.json.tmp"
+mv "$WORK/config.json.tmp" "$WORK/config.json"
+run_manager -f "$WORK/config.json" -n
+assert_exit_code 1 "$RUN_RC" "typo'd ignore_numa exits 1"
+assert_grep "$WORK/run.log" "gpu_settings.ignore_numa must be true or false \(got 'ture'\)" "typo rejected"
 
 # =============================================================================
 scenario "numa_settings validation fails fast; socket entries expand to all their nodes"
